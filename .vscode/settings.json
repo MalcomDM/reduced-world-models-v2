@@ -1,0 +1,16 @@
+{
+	"editor.tabCompletion": "on",
+	"editor.tabSize": 4,
+	"editor.autoIndentOnPasteWithinString": false,
+	"editor.insertSpaces": false,
+
+	"python.defaultInterpreterPath": "/opt/conda/bin/python",
+	"files.exclude": {
+		"**/__pycache__/": true,
+		"**/*.pyc": true,
+		"**/*.egg-info/": true
+	},
+
+	"python.analysis.stubPath": "./typings"
+
+}

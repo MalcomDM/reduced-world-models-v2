@@ -1,0 +1,21 @@
+{
+    "name": "World Models Pytorch-Gym V2",
+    "dockerComposeFile": "docker-compose.yml",
+    "service": "dev-world-models",
+    "workspaceFolder": "/workspaces/${localWorkspaceFolderBasename}",
+    "containerEnv": {
+      "DISPLAY": "${localEnv:DISPLAY}"
+    },
+    "customizations": {
+      "vscode": {
+        "extensions": [
+          "ms-python.python",
+          "ms-toolsai.jupyter"
+        ]
+      }
+    },
+    "mounts": [
+      "source=pip-cache,target=/root/.cache/pip,type=volume",
+      "source=/tmp/.X11-unix,target=/tmp/.X11-unix,type=bind"
+    ]
+}

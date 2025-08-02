@@ -1,0 +1,18 @@
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyd
+*.pyo
+*.egg-info/
+.pytest_cache/
+
+# Jupyter Notebook files
+.ipynb_checkpoints/
+# Optional: if you want to ignore all ipynb output, but keep the notebooks:
+*.ipynb_checkpoints/
+*.nbdata
+*.nbconvert
+
+# Specific to your request: Ignore all content inside the 'runs' folder
+runs/
+data/

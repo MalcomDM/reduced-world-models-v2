@@ -1,0 +1,57 @@
+# BASE CONFIG
+BATCH_SIZE    = 32   # 32 secuencias de 20 pasos por bach
+SAMPLE_BATCH  = 4    # 8 images when visualizing reconstructions
+NUM_WORKERS   = 8    # use half your logical cores for data loading
+PIN_MEMORY    = True # speeds up host→GPU transfer
+
+EPISODE_BATCH_SIZE = 16 
+
+DATASET_DIR = 'data/car_racing/test'
+IN_CHANNELS = 3
+INPUT_DIM   = (64,64,IN_CHANNELS)
+ACTION_DIM  = 3
+
+# CNN ENCODER
+CONV_FILTERS        = [32, 64, 16]
+CONV_KERNEL_SIZES   = [4, 3, 1]
+CONV_STRIDES        = [2, 1, 1]
+CONV_PADDINGS       = [1, 1,  0]
+CONV_ACTIVATIONS    = ['relu','relu', 'relu']
+
+# TOKENIZATION HEAD
+TKN_IN_CHANNELS = CONV_FILTERS[-1]
+FEATURE_MAP_SIZE    = 32     # CNN ENCODER OUPUT SIZE
+PATCH_SIZE          = 4
+PATCH_STRIDE        = 2
+PATCH_PADDING       = 0
+
+NUM_PATCH_DIM = ((FEATURE_MAP_SIZE + 2*PATCH_PADDING - PATCH_SIZE) // PATCH_STRIDE) + 1
+
+TOKEN_DIM           = 16
+
+# ATTENTION TOP-K SELECTOR
+K = 8
+QUERY_DIM = 16 # STARTS WITH TOKEN SIZE
+
+
+# PATCH-RNN
+PRNN_HIDDEN_DIM = 60
+
+# CNN DECODER
+DENSE_SIZE = 4*4*128
+
+CONV_T_FILTERS = [64,32,16,3]
+CONV_T_KERNEL_SIZES = [4,4,4,4]
+CONV_T_STRIDES = [2,2,2,2]
+CONV_T_ACTIVATIONS = ['relu','relu','relu','sigmoid']
+
+# WORLD-RNN
+SEQ_LEN = 20
+WRNN_HIDDEN_DIM = 80
+M_WARMUP =5
+OBSERVATIONAL_DROPOUT = 0.6
+
+
+# TRAIN IMAGE RECONSTRUCTOR VARIABLES
+LEARNING_RATE = 3e-4     # Adam’s sweet spot for VAEs / small CNNs
+WEIGHT_DECAY  = 1e-5     # Small L2 on weights to prevent overfitting

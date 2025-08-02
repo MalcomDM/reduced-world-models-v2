@@ -1,0 +1,19 @@
+services:
+  dev-world-models:
+    container_name: dev-world-models-v2
+    image: dev-world-models-v2
+    shm_size: 2g
+    build: .
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - DISPLAY=${DISPLAY}
+    volumes:
+      - ../..:/workspaces:cached
+      - /tmp/.X11-unix:/tmp/.X11-unix
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+    command: sleep infinity

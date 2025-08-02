@@ -1,0 +1,15 @@
+swig
+pynvml
+
+gymnasium[box2d]
+
+numpy
+pandas
+scikit-learn
+
+matplotlib
+jupyterlab
+
+typer
+
+pytest
