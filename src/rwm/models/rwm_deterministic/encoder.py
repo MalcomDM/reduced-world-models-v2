@@ -1,12 +1,14 @@
 from torch import nn
 from torch import Tensor
+from typing import Dict, Callable
 
 from rwm.config.config import (
 	IN_CHANNELS, CONV_FILTERS, CONV_KERNEL_SIZES,
     CONV_STRIDES, CONV_PADDINGS, CONV_ACTIVATIONS
 )
 
-ACT_MAP = {
+ActivationFactory = Callable[[], nn.Module]
+ACT_MAP: Dict[str, ActivationFactory] = {
     "relu": nn.ReLU,
     "lrelu": lambda: nn.LeakyReLU(0.2),
     "elu": nn.ELU,

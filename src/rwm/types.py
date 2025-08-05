@@ -35,9 +35,7 @@ from torch import Tensor
 
 
 class RolloutSample(TypedDict):
-    obs: Tensor         # shape (T, C, H, W)
-    action: Tensor      # shape (T, 3)
-    reward: Tensor      # shape (T,)
-    done: Tensor        # shape (T,)
-    path: str           # optional: for debugging
-    offset: int
+	obs: Tensor         # shape (T, C, H, W)
+	action: Tensor      # shape (T, 3)
+	reward: Tensor      # shape (T,)
+	done: Tensor        # shape (T,)

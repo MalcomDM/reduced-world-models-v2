@@ -5,13 +5,13 @@ from pathlib import Path
 from rich import print
 from rich.table import Table
 
-from rwm.datasets.rollout_dataset import RolloutDataset
+from rwm.data.rollout_dataset import RolloutDataset
 
 
-app = typer.Typer()
+app = typer.Typer(invoke_without_command=True)
 
 
-@app.command()
+@app.callback(invoke_without_command=True)
 def inspect(
     root_dir: 		Path = typer.Argument(..., help="Path to rollout data"),
     sequence_len: 	 int = typer.Option(16, help="Length of each sampled sequence"),

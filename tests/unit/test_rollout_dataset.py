@@ -2,7 +2,7 @@ import pytest
 import numpy as np
 from pathlib import Path
 
-from rwm.datasets.rollout_dataset import RolloutDataset
+from rwm.data.rollout_dataset import RolloutDataset
 
 
 @pytest.mark.dataset

@@ -1,7 +1,6 @@
 import math
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 from rwm.config.config import TOKEN_DIM, QUERY_DIM
 
@@ -13,7 +12,7 @@ class AttentionScorer(nn.Module):
     learned query) to all tokens.
     """
     def __init__(self):
-        super().__init__()
+        super().__init__()												# type: ignore[reportUnknownMemberType]
         self.to_k = nn.Linear(TOKEN_DIM, QUERY_DIM, bias=False)
         self.query = nn.Parameter(torch.rand(1, QUERY_DIM))
 

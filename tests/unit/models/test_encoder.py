@@ -3,7 +3,7 @@ import torch
 from torch import Tensor
 
 from rwm.models.rwm_deterministic.encoder import Encoder
-from rwm.config.config import INPUT_DIM
+from rwm.config.config import INPUT_DIM, CONV_FILTERS, FEATURE_MAP_SIZE
 
 
 @pytest.mark.models
@@ -22,8 +22,8 @@ def test_encoder_output_shape() -> None:
 	b, c_out, h_out, w_out = output.shape
 
 	assert b == batch_size, f"Batch size mismatch: got {b}, expected {batch_size}"
-	assert c_out > 0, "Output channels must be > 0"
-	assert h_out > 0 and w_out > 0, "Output spatial dims must be > 0"
+	assert c_out == CONV_FILTERS[-1], "Output channels must be > 0"
+	assert h_out == w_out == FEATURE_MAP_SIZE, f"Output spatial dims must be == {FEATURE_MAP_SIZE}"
 
 
 @pytest.mark.models
