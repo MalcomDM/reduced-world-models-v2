@@ -1,6 +1,10 @@
 from enum import Enum
-from typing import TypedDict
+from typing import TypedDict, Tuple, List
 
+from torch import Tensor
+
+
+ROLLOUT = Tuple[List[Tensor], List[Tensor], List[float], float]
 
 
 class PolicyName( Enum):

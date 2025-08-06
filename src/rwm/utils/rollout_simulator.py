@@ -52,7 +52,7 @@ class RolloutSimulator:
 			a_prev = act_seq[i]
 
 			img_t = preprocess_obs(obs).to(self.device)
-			a_t   = torch.from_numpy(a_prev[None]).to(self.device)	# type: ignore
+			a_t = torch.from_numpy(a_prev[None]).float().to(self.device)	# type: ignore
 			
 			h, c, *_ = self.model.forward(
 				img=img_t, a_prev=a_t, h_prev=h, c_prev=c,

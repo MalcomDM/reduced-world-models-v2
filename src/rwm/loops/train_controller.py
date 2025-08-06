@@ -1,4 +1,4 @@
-import os, csv, random
+import os, csv, random, time
 import numpy as np
 from tqdm import tqdm
 from typing import List, Tuple
@@ -26,7 +26,7 @@ class ControllerTrainer:
 		scenarios_dirs: List[str],
 		warmup_steps: int = 5,
 		rollout_len: int = 20,
-		noise_std: float = 0.1,
+		noise_std: float = 0.3,
 		lr: float = 1e-3,
 		device: str = "cuda"
 	) -> None:
@@ -55,24 +55,30 @@ class ControllerTrainer:
 
 	def _select_topk(self, rollouts: List[Rollout], k: int) -> List[Rollout]:
 		""" Sort by cumulative reward and return top k. """
-		return sorted(rollouts, key=lambda x: x[3], reverse=True)[:k]
+		positive_rollouts = [r for r in rollouts if r[3] > 0]
+		if not positive_rollouts:
+			return []
+		return sorted(positive_rollouts, key=lambda x: x[3], reverse=True)[:k]
 
 
 	def _optimize_topk(self, top_rollouts: List[Rollout]) -> float:
 		""" Backprop on the top trajectories; returns accumulated loss. """
-		total_loss = 0.0
 		self.controller.train()
 		self.optimizer.zero_grad()
 
-		for latents, actions, _, _ in top_rollouts:
+		losses: List[Tensor] = []
+
+		for latents, actions, *_ in top_rollouts:
 			for h_t, a_t in zip(latents, actions):
 				pred = self.controller(h_t)
 				loss = nn.functional.mse_loss(pred, a_t.detach())
-				loss.backward()										# type: ignore
-				total_loss += float(loss.item())
+				losses.append(loss)
 
-		self.optimizer.step()										# type: ignore
-		return total_loss
+		total_loss_tensor = torch.stack(losses).sum()
+		total_loss_tensor.backward()						# type: ignore
+		self.optimizer.step()								# type: ignore
+
+		return float(total_loss_tensor.item())
 	
 
 	def train(
@@ -92,22 +98,31 @@ class ControllerTrainer:
 			
 		pbar: tqdm[int] = tqdm(range(1, epochs + 1), desc="Training", unit="epoch")
 		for epoch in pbar:
-			rollouts = []
-			for _ in range(n_rollouts):
-				scenario = random.choice(self.scenarios_dirs)
-				rollouts = self.simulator.generate_rollouts(scenario, n_rollouts)			# 1) generate imagined rollouts
-				top_rollouts = self._select_topk(rollouts, top_k)									# 2) pick the best k
-				total_loss = self._optimize_topk(top_rollouts)										# 3) update controller on those
+			t0 = time.time()
 
-				avg_reward = float(np.mean([r[3] for r in top_rollouts]))
-				pbar.set_postfix({							# type: ignore
-					"avg_reward": f"{avg_reward:.2f}",
-					"loss":       f"{total_loss:.4f}"
-				})
+			scenario = random.choice(self.scenarios_dirs)
+			rollouts = self.simulator.generate_rollouts(scenario, n_rollouts)			# 1) generate imagined rollouts
+			top_rollouts = self._select_topk(rollouts, top_k)							# 2) pick the best k
+			if not top_rollouts:
+				print(f"⚠️ Skipping epoch {epoch} — no positive-reward rollouts")
+				continue
 
-				with open(metrics_path, "a", newline="") as f:
-					writer = csv.writer(f)
-					writer.writerow([epoch, f"{avg_reward:.2f}", f"{total_loss:.4f}"])
+			total_loss = self._optimize_topk(top_rollouts)								# 3) update controller on those
+
+			avg_reward = float(np.mean([r[3] for r in top_rollouts]))
+			duration = time.time() - t0
+
+			n_positives = len([r for r in rollouts if r[3] > 0])
+			pbar.set_postfix({							# type: ignore
+				"avg_reward": f"{avg_reward:.2f}",
+				"loss":       f"{total_loss:.4f}",
+				"time":       f"{duration:.1f}s",
+				"positives":       f"{n_positives}/{len(rollouts)}"
+			})
+
+			with open(metrics_path, "a", newline="") as f:
+				writer = csv.writer(f)
+				writer.writerow([epoch, f"{avg_reward:.2f}", f"{total_loss:.4f}"])
 
 		torch.save(self.controller.state_dict(), "controller.pt")	# 4) save final weights
 		pbar.close()
