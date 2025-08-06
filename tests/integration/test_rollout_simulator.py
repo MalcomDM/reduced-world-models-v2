@@ -66,9 +66,9 @@ def test_generate_rollouts(tmp_path: Path, dummy_world_model: ReducedWorldModel,
 
     # Expect exactly 2 rollouts
     assert len(rollouts) == 2
-    for latents, actions, rewards, cum in rollouts:
+    for r in rollouts:
         # Each imagined rollout should have length == rollout_len
-        assert len(latents) == 3
-        assert len(actions) == 3
-        assert len(rewards) == 3
-        assert cum == sum(rewards)
+        assert len(r.latents) == 3
+        assert len(r.sim_acts) == 3
+        assert len(r.rewards) == 3
+        assert r.cum_reward == sum(r.rewards)

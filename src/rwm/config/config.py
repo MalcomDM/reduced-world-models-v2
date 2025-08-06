@@ -60,3 +60,4 @@ WEIGHT_DECAY  = 1e-5     # Small L2 on weights to prevent overfitting
 
 # TRAINING LOOP VARIABLES
 ERROR_THRESHOLD=0.35
+MEMORY_BATCH=20

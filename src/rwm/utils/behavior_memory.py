@@ -1,13 +1,12 @@
 import os, pickle
 import numpy as np
 from pathlib import Path
-from typing import List, Dict, Any, Optional
+from typing import Tuple, List, Dict, Any, Optional
 from numpy.typing import NDArray
 
 import torch
 from torch import Tensor
 
-from rwm.types import ROLLOUT
 from rwm.config.config import WRNN_HIDDEN_DIM
 from rwm.utils.preprocess_observation import preprocess_obs
 
@@ -38,21 +37,24 @@ class BehaviorMemory:
 	def add(
 			self,
 			initial_state: Tensor,
-			rollout: ROLLOUT,
-			obs_seq: NDArray[np.uint8],
-			act_seq: NDArray[np.float32]
+			cum_reward: float,
+			real_obs: NDArray[np.uint8],
+			real_acts: NDArray[np.float32]
 	) -> None:
-		"""Store or replace rollout for a given state if it performs better."""
+		"""
+		Store or replace the best behavior for the given initial latent state.
+		real_obs/real_acts define the warmup segment to re-simulate later.
+		"""
 		key = self.hash_state(initial_state)
-		_, _, _, cum_reward = rollout
-
 		should_replace = (key not in self.states) or (cum_reward > self.states[key]["cum_reward"])
+
 		if should_replace:
-			self._save_situation(key, obs_seq, act_seq)
+			self._save_situation(key, real_obs, real_acts)
+			prev_count = self.states.get(key, {}).get("reencode_count", 0)
 			self.states[key] = {
 				"file": f"{key}.npz",
 				"cum_reward": cum_reward,
-				"reencode_count": self.states.get(key, {}).get("reencode_count", 0)
+				"reencode_count": prev_count
 			}
 
 			if len(self.states) > self.max_size:
@@ -88,6 +90,13 @@ class BehaviorMemory:
 		with open(path, "rb") as f:
 			self.states = pickle.load(f)
 
+	def load_obs_and_act(self, path:Path) -> Tuple[NDArray[np.uint8], NDArray[np.float32]]:
+		with np.load(path) as data:
+			obs_seq = data["obs"]
+			act_seq = data["actions"]
+		return obs_seq, act_seq
+
+
 
 	def recompute_keys(self, model: torch.nn.Module) -> None:
 		new_states: Dict[str, Dict[str, Any]] = {}
@@ -95,9 +104,7 @@ class BehaviorMemory:
 
 		for _old_key, info in self.states.items():
 			path = self.situation_dir / info["file"]
-			with np.load(path) as data:
-				obs_seq = data["obs"]
-				act_seq = data["actions"]
+			obs_seq, act_seq = self.load_obs_and_act(path)
 
 			h = torch.zeros(1, WRNN_HIDDEN_DIM, device=device)
 			c = torch.zeros_like(h)

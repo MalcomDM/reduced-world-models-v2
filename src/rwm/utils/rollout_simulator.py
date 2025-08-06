@@ -8,12 +8,10 @@ from torch import Tensor
 
 from rwm.models.rwm_deterministic.model import ReducedWorldModel
 from rwm.policies.controller_policy import ControllerPolicy
+from rwm.types import Rollout
 from rwm.utils.load_rollouts_from_scenario import load_rollouts_from_scenario
 from rwm.utils.preprocess_observation import preprocess_obs  # your full model
 
-
-
-Rollout = Tuple[List[Tensor], List[Tensor], List[float], float]
 
 
 class RolloutSimulator:
@@ -111,5 +109,7 @@ class RolloutSimulator:
 
 			h, c, h_spatial = self.warmup_state(seg_obs, seg_act)
 			latents, actions, rewards = self.imagine_rollout(h, c, h_spatial)
-			results.append((latents, actions, rewards, sum(rewards)))
+			results.append(
+				Rollout(obs_seq, act_seq, latents, actions, rewards, sum(rewards))
+			)
 		return results

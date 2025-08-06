@@ -1,10 +1,22 @@
+import numpy as np
 from enum import Enum
-from typing import TypedDict, Tuple, List
+from dataclasses import dataclass
+from typing import TypedDict, List
+from numpy.typing import NDArray
+
 
 from torch import Tensor
 
 
-ROLLOUT = Tuple[List[Tensor], List[Tensor], List[float], float]
+@dataclass(frozen=True)
+class Rollout:
+    real_obs: 	"NDArray[np.uint8]"		# real observations
+    real_acts:  "NDArray[np.float32]"	# real actions
+    
+    latents:    List[Tensor]   			# hidden states from imagine_rollout
+    sim_acts:    List[Tensor] 	# the full segment of real actions used for warmup
+    rewards:    List[float]    			# per-step predicted rewards
+    cum_reward: float          			# sum(rewards)
 
 
 class PolicyName( Enum):
