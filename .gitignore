@@ -16,3 +16,7 @@ __pycache__/
 # Specific to your request: Ignore all content inside the 'runs' folder
 runs/
 data/
+
+# environment
+.env
+.vscode/

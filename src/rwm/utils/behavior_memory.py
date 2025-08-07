@@ -29,8 +29,8 @@ class BehaviorMemory:
 		return torch.round(state * 100).to(torch.int).cpu().numpy().tobytes().hex()		# type: ignore
 	
 
-	def _save_situation(self, key: str, obs: NDArray[np.uint8], actions: NDArray[np.float32] ) -> None:
-		path = self.situation_dir / f"{key}.npz"
+	def _save_situation(self, filename: str, obs: NDArray[np.uint8], actions: NDArray[np.float32] ) -> None:
+		path = self.situation_dir / filename
 		np.savez(path, obs=obs, actions=actions)
 
 
@@ -46,13 +46,15 @@ class BehaviorMemory:
 		real_obs/real_acts define the warmup segment to re-simulate later.
 		"""
 		key = self.hash_state(initial_state)
+		fname = key[:16]
+		npz_name = f"{fname}.npz"
 		should_replace = (key not in self.states) or (cum_reward > self.states[key]["cum_reward"])
 
 		if should_replace:
-			self._save_situation(key, real_obs, real_acts)
+			self._save_situation(npz_name, real_obs, real_acts)
 			prev_count = self.states.get(key, {}).get("reencode_count", 0)
 			self.states[key] = {
-				"file": f"{key}.npz",
+				"file": npz_name,
 				"cum_reward": cum_reward,
 				"reencode_count": prev_count
 			}

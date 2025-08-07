@@ -1,7 +1,9 @@
 import random
 import numpy as np
+from tqdm import tqdm
 from numpy.typing import NDArray
 from typing import List, Tuple
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import torch
 from torch import Tensor
@@ -45,18 +47,19 @@ class RolloutSimulator:
 		first_img = preprocess_obs(obs_seq[0]).to(self.device)
 		h_spatial: Tensor = self.model.generate_spatial_rep(first_img)
 
-		for i in range(self.warmup_steps):
-			obs = obs_seq[i]
-			a_prev = act_seq[i]
+		with torch.no_grad():
+			for i in range(self.warmup_steps):
+				obs = obs_seq[i]
+				a_prev = act_seq[i]
 
-			img_t = preprocess_obs(obs).to(self.device)
-			a_t = torch.from_numpy(a_prev[None]).float().to(self.device)	# type: ignore
-			
-			h, c, *_ = self.model.forward(
-				img=img_t, a_prev=a_t, h_prev=h, c_prev=c,
-				force_keep_input=True
-			)
-			h_spatial = self.model.generate_spatial_rep(img_t)
+				img_t = preprocess_obs(obs).to(self.device)
+				a_t = torch.from_numpy(a_prev[None]).float().to(self.device)	# type: ignore
+				
+				h, c, *_ = self.model.forward(
+					img=img_t, a_prev=a_t, h_prev=h, c_prev=c,
+					force_keep_input=True
+				)
+				h_spatial = self.model.generate_spatial_rep(img_t)
 
 		return h, c, h_spatial
 
@@ -77,39 +80,55 @@ class RolloutSimulator:
 
 		zero_spatial = torch.zeros_like(h_spatial, device=self.device)
 
-		for i in range(self.rollout_len):
-			latent_hist.append(h)
-			a_t = self.policy.act_from_rwm_state(h).to(self.device)
-			action_hist.append(a_t)
+		with torch.no_grad():
+			for i in range(self.rollout_len):
+				latent_hist.append(h)
+				a_t = self.policy.act_from_rwm_state(h).to(self.device)
+				action_hist.append(a_t)
 
-			x_spatial = h_spatial if i == 0 else zero_spatial
+				x_spatial = h_spatial if i == 0 else zero_spatial
 
-			h, c, r = self.model.world_rnn(
-				h_prev=h, c_prev=c,
-				x_spatial=x_spatial,
-				a_prev=a_t,
-				force_keep_input=True
-			)
-			reward_hist.append(r.item())
+				h, c, r = self.model.world_rnn(
+					h_prev=h, c_prev=c,
+					x_spatial=x_spatial,
+					a_prev=a_t,
+					force_keep_input=True
+				)
+				reward_hist.append(r.item())
+				h = h.detach()
 
 		return latent_hist, action_hist, reward_hist
+	
+
+	def _generate_one(self, scenarios_dir: str) -> Rollout:
+		# exactly the body of your old loop, but for one rollout
+		obs_seq, act_seq = load_rollouts_from_scenario(scenarios_dir)
+		max_start = len(obs_seq) - (self.warmup_steps + self.rollout_len)
+		start = random.randint(0, max_start)
+
+		seg_obs = obs_seq[start : start + self.warmup_steps + self.rollout_len]
+		seg_acts = act_seq[start : start + self.warmup_steps + self.rollout_len]
+
+		h, c, h_spatial = self.warmup_state(seg_obs, seg_acts)
+		latents, sim_acts, rewards = self.imagine_rollout(h, c, h_spatial)
+		cum = float(sum(rewards))
+
+		return Rollout(
+			real_obs=seg_obs,
+			real_acts=seg_acts,
+			latents=latents,
+			sim_acts=sim_acts,
+			rewards=rewards,
+			cum_reward=cum
+		)
 
 
 	def generate_rollouts(self, scenarios_dir: str, n: int) -> List[Rollout]:
 		"""Sample `n` segments from real `.npz` files, warm up, then imagine."""
 
 		results: List[Rollout] = []
-		for _ in range(n):
-			obs_seq, act_seq = load_rollouts_from_scenario(scenarios_dir)
-			max_start = len(obs_seq) - (self.warmup_steps + self.rollout_len)
-			start = random.randint(0, max_start)
-
-			seg_obs = obs_seq[start : start + self.warmup_steps + self.rollout_len]
-			seg_act = act_seq[start : start + self.warmup_steps + self.rollout_len]
-
-			h, c, h_spatial = self.warmup_state(seg_obs, seg_act)
-			latents, actions, rewards = self.imagine_rollout(h, c, h_spatial)
-			results.append(
-				Rollout(obs_seq, act_seq, latents, actions, rewards, sum(rewards))
-			)
+		with ThreadPoolExecutor() as exe:
+			futures = [exe.submit(self._generate_one, scenarios_dir) for _ in range(n)]
+			for fut in tqdm(as_completed(futures), total=n, desc="Generating rollouts"):
+				results.append(fut.result())
 		return results
