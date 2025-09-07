@@ -11,7 +11,7 @@ import torch.nn.functional as F
 
 from rwm.config.config import ACTION_DIM, WRNN_HIDDEN_DIM
 from rwm.types import RolloutSample
-from rwm.models.rwm_deterministic.model import ReducedWorldModel
+from rwm.models.rwm.model import ReducedWorldModel
 
 
 class WorldModelTrainer:

@@ -8,7 +8,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import torch
 from torch import Tensor
 
-from rwm.models.rwm_deterministic.model import ReducedWorldModel
+from rwm.models.rwm.model import ReducedWorldModel
 from rwm.policies.controller_policy import ControllerPolicy
 from rwm.types import Rollout
 from rwm.utils.load_rollouts_from_scenario import load_rollouts_from_scenario
@@ -100,9 +100,8 @@ class RolloutSimulator:
 		return latent_hist, action_hist, reward_hist
 	
 
-	def _generate_one(self, scenarios_dir: str) -> Rollout:
+	def _generate_one(self, scenarios_dir: str, obs_seq: NDArray[np.uint8], act_seq: NDArray[np.float32]) -> Rollout:
 		# exactly the body of your old loop, but for one rollout
-		obs_seq, act_seq = load_rollouts_from_scenario(scenarios_dir)
 		max_start = len(obs_seq) - (self.warmup_steps + self.rollout_len)
 		start = random.randint(0, max_start)
 
@@ -127,8 +126,9 @@ class RolloutSimulator:
 		"""Sample `n` segments from real `.npz` files, warm up, then imagine."""
 
 		results: List[Rollout] = []
+		obs_seq, act_seq = load_rollouts_from_scenario(scenarios_dir)
 		with ThreadPoolExecutor() as exe:
-			futures = [exe.submit(self._generate_one, scenarios_dir) for _ in range(n)]
+			futures = [exe.submit(self._generate_one, scenarios_dir, obs_seq, act_seq) for _ in range(n)]
 			for fut in tqdm(as_completed(futures), total=n, desc="Generating rollouts"):
 				results.append(fut.result())
 		return results

@@ -26,4 +26,4 @@ class AttentionScorer(nn.Module):
         scores = (Q @ K.transpose(-2, -1)).squeeze(1)   # (B, N)
         logits = scores / math.sqrt(K.size(-1))
         
-        return logits   # Feed into Gumbel/STE selector
+        return logits 

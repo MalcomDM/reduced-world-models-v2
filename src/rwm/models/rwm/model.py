@@ -4,12 +4,12 @@ from torch import Tensor
 from typing import Tuple
 
 from rwm.config.config import ACTION_DIM, OBSERVATIONAL_DROPOUT
-from rwm.models.rwm_deterministic.encoder import Encoder
-from rwm.models.rwm_deterministic.tokenization_head import TokenizationHead
-from rwm.models.rwm_deterministic.attention_scorer import AttentionScorer
-from rwm.models.rwm_deterministic.topk_gumbel_selector import TopKGumbelSelector
-from rwm.models.rwm_deterministic.patch_rnn import PatchRNN
-from rwm.models.rwm_deterministic.world_rnn import WorldRNN
+from rwm.models.rwm.encoder import Encoder
+from rwm.models.rwm.tokenization_head import TokenizationHead
+from rwm.models.rwm.attention_scorer import AttentionScorer
+from rwm.models.rwm.topk_gumbel_selector import TopKGumbelSelector
+from rwm.models.rwm.spatial_attention_head import SpatialAttentionHead
+from rwm.models.rwm.casusal_transformer import CausalTransformer
 
 
 
@@ -22,8 +22,8 @@ class ReducedWorldModel(nn.Module):
 		self.tokenizer = TokenizationHead()
 		self.scorer = AttentionScorer()
 		self.selector = TopKGumbelSelector()
-		self.patch_rnn = PatchRNN()
-		self.world_rnn = WorldRNN(action_dim=action_dim, dropout_prob=dropout_prob)
+		self.spatial_hd = SpatialAttentionHead()
+		self.world_hd = CausalTransformer()
 
 	def forward(
 		self,
@@ -37,12 +37,12 @@ class ReducedWorldModel(nn.Module):
 		tokens = self.tokenizer(feat)               # (B, N, D), donde N = (H'·W'), D = TOKEN_DIM
 		logits = self.scorer(tokens)                # (B, N)
 		mask, indices = self.selector(logits)       # mask:(B,N), indices:(B,K)
-		h_spatial = self.patch_rnn(tokens, indices) # (B, PRNN_HIDDEN_DIM)
+		h_esp, w = self.spatial_hd(tokens, mask)	# (B, PRNN_HIDDEN_DIM)
 
-		h_new, _, r_pred = self.world_rnn(			# c_new as _
+		h_new, _, r_pred = self.world_hd(			# c_new as _
 			h_prev=h_prev,
 			c_prev=c_prev,
-			x_spatial=h_spatial,
+			x_spatial=h_esp,
 			a_prev=a_prev,
 			force_keep_input=force_keep_input
 		)
@@ -55,6 +55,6 @@ class ReducedWorldModel(nn.Module):
 		tokens = self.tokenizer(feat)
 		logits = self.scorer(tokens)
 		_, idx = self.selector(logits)
-		h_spatial: Tensor = self.patch_rnn(tokens, idx)
+		h_spatial: Tensor = self.spatial_hd(tokens, idx)
 
 		return h_spatial

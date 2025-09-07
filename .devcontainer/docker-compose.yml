@@ -1,7 +1,7 @@
 services:
   dev-world-models:
-    container_name: dev-world-models-v2
-    image: dev-world-models-v2
+    container_name: dev-world-models-v3
+    image: dev-world-models-v3
     shm_size: 2g
     build: .
     runtime: nvidia

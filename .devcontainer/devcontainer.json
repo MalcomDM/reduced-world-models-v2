@@ -1,5 +1,5 @@
 {
-    "name": "World Models Pytorch-Gym V2",
+    "name": "World Models Pytorch-Gym V3",
     "dockerComposeFile": "docker-compose.yml",
     "service": "dev-world-models",
     "workspaceFolder": "/workspaces/${localWorkspaceFolderBasename}",

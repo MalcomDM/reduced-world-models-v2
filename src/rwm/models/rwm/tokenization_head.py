@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 from torch import Tensor
-from typing import ClassVar
+from typing import ClassVar, Tuple
 
 from rwm.config.config import (
     PATCH_SIZE, PATCH_STRIDE, PATCH_PADDING,
@@ -35,8 +35,8 @@ _POS_EMBED: Tensor = _build_positional_encoding(PATCHES_PER_SIDE, TOKEN_DIM)
 
 class TokenizationHead(nn.Module):
 	"""
-	Splits a feature map into patches and projects each to TOKEN_DIM,
-	then adds a fixed sinusoidal positional embedding.
+    A variational tokenization head inspired by VAEs.
+    Maps patches to a distribution (mean, log_variance) and samples from it.
 	"""
 	pos_embed_buffer: ClassVar[Tensor] 
 
@@ -45,18 +45,26 @@ class TokenizationHead(nn.Module):
 		super().__init__()				# type: ignore[reportUnknownMemberType]
 		P, S, pad = PATCH_SIZE, PATCH_STRIDE, PATCH_PADDING
 
-		self.unfold = nn.Unfold(kernel_size=P, stride=S, padding=pad)		# Unfold layer: (B, C, H, W) -> (B, C*P*P, N)
-		self.projection = nn.Linear(TKN_IN_CHANNELS * P * P, TOKEN_DIM)		# Linear projection of each flattened patch
+		self.unfold = nn.Unfold(kernel_size=P, stride=S, padding=pad)		 # Unfold layer: (B, C, H, W) -> (B, C*P*P, N)
+		self.projection = nn.Linear(TKN_IN_CHANNELS * P * P, TOKEN_DIM * 2 ) # Linear projection of each flattened patch to mean and log_var
 
 		# Register the shared positional-encoding buffer
 		self.register_buffer('pos_embed_buffer', _POS_EMBED)
 
 
-	def forward(self, feature_map: torch.Tensor) -> torch.Tensor:
-		# feature_map: (B, C, H, W)
-		patches = self.unfold(feature_map)                  # 1) Extract patches: (B, C*P*P, N)
-		patches: torch.Tensor  = patches.permute(0, 2, 1)   # 2) Reorder to (B, N, C*P*P)
-		tokens = self.projection(patches)                   # 3) Project to (B, N, TOKEN_DIM)
-		tokens = tokens + self.pos_embed_buffer             # 4) Add positional embeddings (broadcast batch dim)
-		return tokens										# returns => (B, N, TOKEN_DIM)
+	def forward(self, feature_map: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+		patches = self.unfold(feature_map).permute(0, 2, 1)					# (B, C, H, W) -> (B, C*P*P, N) -> (B, N, C*P*P)
+
+		# 1) Project to mean and log_variance
+		projected_patches = self.projection(patches)						# (B, N, TOKEN_DIM * 2)
+		mean, log_var = torch.chunk(projected_patches, 2, dim=-1)			# (B, N, TOKEN_DIM ) * 2
+
+		# 2) Reparameterization trick
+		std = torch.exp(0.5 * log_var)
+		eps = torch.randn_like(std)
+		tokens = mean + eps * std
+
+		# 3) Add positional embeddings
+		tokens = tokens + self.pos_embed_buffer
+		return tokens, mean, log_var
 

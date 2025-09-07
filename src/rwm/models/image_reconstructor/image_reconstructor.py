@@ -1,11 +1,11 @@
 import torch
 import torch.nn as nn
 
-from rwm.models.rwm_deterministic.encoder import Encoder
-from rwm.models.rwm_deterministic.tokenization_head import TokenizationHead
-from rwm.models.rwm_deterministic.attention_scorer import AttentionScorer
-from rwm.models.rwm_deterministic.topk_gumbel_selector import TopKGumbelSelector
-from rwm.models.rwm_deterministic.patch_rnn import PatchRNN
+from rwm.models.rwm.encoder import Encoder
+from rwm.models.rwm.tokenization_head import TokenizationHead
+from rwm.models.rwm.attention_scorer import AttentionScorer
+from rwm.models.rwm.topk_gumbel_selector import TopKGumbelSelector
+from rwm.models.rwm.patch_rnn import PatchRNN
 from rwm.models.image_reconstructor.decoder import Decoder
 
 

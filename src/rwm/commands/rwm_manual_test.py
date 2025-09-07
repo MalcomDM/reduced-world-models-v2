@@ -10,7 +10,7 @@ from typing import Any
 import gymnasium as gym
 from gymnasium.core import Env
 
-from rwm.models.rwm_deterministic.model import ReducedWorldModel
+from rwm.models.rwm.model import ReducedWorldModel
 from rwm.policies.human_policy import HumanPolicy
 from rwm.config.config import ACTION_DIM, WRNN_HIDDEN_DIM, INPUT_DIM, M_WARMUP
 

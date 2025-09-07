@@ -47,15 +47,8 @@ class TopKGumbelSelector(nn.Module):
 			# deterministic top-K in eval
 			topk_logits = logits
 
-		# 2) Get hard top-k indices
-		topk_indices = topk_logits.topk(self.k, dim=1).indices # (B, K)
-
-		# 3) Build hard mask
-		mask_hard = torch.zeros_like(logits).scatter_(1, topk_indices, 1.0)
-
-		# 4) Compute a "soft" mask via plain softmax on clean logits
-		mask_soft = F.softmax(logits / self.temp, dim=1)
-
-		# 5) Straight-through: use hard in forward, soft in backward
-		mask = (mask_hard - mask_soft).detach() + mask_soft
+		topk_indices = topk_logits.topk(self.k, dim=1).indices # (B, K)				# 2) Get hard top-k indices
+		mask_hard = torch.zeros_like(logits).scatter_(1, topk_indices, 1.0)			# 3) Build hard mask
+		mask_soft = F.softmax(logits / self.temp, dim=1)							# 4) Compute a "soft" mask via plain softmax on clean logits
+		mask = (mask_hard - mask_soft).detach() + mask_soft							# 5) Straight-through: use hard in forward, soft in backward
 		return mask, topk_indices

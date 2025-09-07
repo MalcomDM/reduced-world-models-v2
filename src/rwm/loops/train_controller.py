@@ -9,7 +9,7 @@ import torch.optim as optim
 from torch import Tensor
 
 from rwm.config.config import MEMORY_BATCH, POSITIVE_THRESHOLD
-from rwm.models.rwm_deterministic.model import ReducedWorldModel
+from rwm.models.rwm.model import ReducedWorldModel
 from rwm.models.controller.model import Controller
 from rwm.policies.controller_policy import ControllerPolicy
 from rwm.types import Rollout

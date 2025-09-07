@@ -5,7 +5,7 @@ from typing import List
 
 from rwm.loops.train_controller import ControllerTrainer
 from rwm.models.controller.model import Controller
-from rwm.models.rwm_deterministic.model import ReducedWorldModel
+from rwm.models.rwm.model import ReducedWorldModel
 
 app = typer.Typer()
 

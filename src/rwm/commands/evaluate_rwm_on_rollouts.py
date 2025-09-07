@@ -7,7 +7,7 @@ from torch.utils.data import DataLoader
 
 from rwm.config.config import WRNN_HIDDEN_DIM
 from rwm.data.rollout_dataset import RolloutDataset
-from rwm.models.rwm_deterministic.model import ReducedWorldModel
+from rwm.models.rwm.model import ReducedWorldModel
 
 
 app = typer.Typer()
