@@ -59,12 +59,15 @@ class TokenizationHead(nn.Module):
 		projected_patches = self.projection(patches)						# (B, N, TOKEN_DIM * 2)
 		mean, log_var = torch.chunk(projected_patches, 2, dim=-1)			# (B, N, TOKEN_DIM ) * 2
 
-		# 2) Reparameterization trick
-		std = torch.exp(0.5 * log_var)
-		eps = torch.randn_like(std)
-		tokens = mean + eps * std
+		# 2) Reparameterization trick during training.  Evaluation uses the
+		# posterior mean so a fixed checkpoint gives stable reward predictions.
+		if self.training:
+			std = torch.exp(0.5 * log_var)
+			eps = torch.randn_like(std)
+			tokens = mean + eps * std
+		else:
+			tokens = mean
 
 		# 3) Add positional embeddings
 		tokens = tokens + self.pos_embed_buffer
 		return tokens, mean, log_var
-

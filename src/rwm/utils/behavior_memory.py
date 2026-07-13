@@ -7,7 +7,7 @@ from numpy.typing import NDArray
 import torch
 from torch import Tensor
 
-from rwm.config.config import WRNN_HIDDEN_DIM
+from rwm.config.config import WORLD_STATE_DIM
 from rwm.utils.preprocess_observation import preprocess_obs
 
 
@@ -101,38 +101,18 @@ class BehaviorMemory:
 
 
 	def recompute_keys(self, model: torch.nn.Module) -> None:
-		new_states: Dict[str, Dict[str, Any]] = {}
-		device = next(model.parameters()).device
+		"""Recompute latent keys using a world model.
 
-		for _old_key, info in self.states.items():
-			path = self.situation_dir / info["file"]
-			obs_seq, act_seq = self.load_obs_and_act(path)
-
-			h = torch.zeros(1, WRNN_HIDDEN_DIM, device=device)
-			c = torch.zeros_like(h)
-
-			for i in range(len(obs_seq)):
-				img_t = preprocess_obs(obs_seq[i]).unsqueeze(0).to(device)
-				a_t = torch.from_numpy(act_seq[i:i+1]).to(device)										# type: ignore
-
-				h, c, *_ = model.forward(img_t, a_t, h, c, force_keep_input=True)
-			
-			new_key = self.hash_state(h)
-			prev_reencode = info.get("reencode_count", 0)
-
-			if new_key in new_states:
-				if info["cum_reward"] > new_states[new_key]["cum_reward"]:
-					new_states[new_key] = {
-						**info,
-						"reencode_count": new_states[new_key].get("reencode_count", prev_reencode) + 1
-					}
-				else:
-					new_states[new_key]["reencode_count"] += 1
-			else:
-				new_states[new_key] = {
-					**info,
-					"reencode_count": prev_reencode + 1
-				}
-
-		self.states = new_states
+		.. deprecated::
+		   This method was written for the legacy LSTM interface
+		   (``h_prev``, ``c_prev``) and is incompatible with the
+		   current ``CausalTransformer``-based world model.
+		"""
+		raise NotImplementedError(
+			"behavior_memory.recompute_keys uses the legacy LSTM "
+			"interface (h_prev, c_prev) which is not available in "
+			"the CausalTransformer-based ReducedWorldModel.\n\n"
+			"This path will be replaced by Actor-Critic training "
+			"(Stage 4) and is intentionally disabled."
+		)
 

@@ -14,6 +14,13 @@ class HumanPolicy(BasePolicy):
 
     def reset(self) -> None:
         self.running = True
+        # Some Gym renderers initialise SDL lazily on ``env.reset()``.  Keep
+        # the policy safe when it is used before that renderer has created a
+        # window (as can happen in interactive evaluation commands).
+        if not pygame.get_init():
+            pygame.init()
+        if not pygame.display.get_init():
+            pygame.display.init()
         pygame.event.clear()
 
 

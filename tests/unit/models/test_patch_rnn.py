@@ -1,6 +1,6 @@
 import pytest
 import torch
-from rwm.models.rwm_deterministic.patch_rnn import PatchRNN
+from rwm.models.rwm.patch_rnn import PatchRNN
 from rwm.config.config import K, TOKEN_DIM, PRNN_HIDDEN_DIM
 
 @pytest.mark.models

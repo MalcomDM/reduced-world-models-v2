@@ -6,7 +6,7 @@ from pathlib import Path
 from rwm.loops.train_controller import ControllerTrainer
 from rwm.utils.behavior_memory import BehaviorMemory
 from rwm.utils.rollout_simulator import RolloutSimulator
-from rwm.models.rwm_deterministic.model import ReducedWorldModel
+from rwm.models.rwm.model import ReducedWorldModel
 from rwm.models.controller.model import Controller
 from rwm.policies.controller_policy import ControllerPolicy
 
@@ -19,7 +19,7 @@ def small_memory(tmp_path: Path) -> BehaviorMemory:
     # Build dummy obs/actions: warmup_steps=2 + rollout_len=3
     obs = np.zeros((5,64,64,3), dtype=np.uint8)
     acts = np.zeros((5,3), dtype=np.float32)
-    h0 = torch.zeros(1, ReducedWorldModel().world_rnn.rnn_cell.hidden_size)
+    h0 = torch.zeros(1, ReducedWorldModel().world_hd.d_model)
 
     # Add one entry with cum_reward=1.0
     bm.add(h0, 1.0, obs, acts)

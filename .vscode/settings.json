@@ -3,6 +3,7 @@
 	"editor.tabSize": 4,
 	"editor.autoIndentOnPasteWithinString": false,
 	"editor.insertSpaces": false,
+	"terminal.integrated.copyOnSelection": true,
 
 	"python.defaultInterpreterPath": "/opt/conda/bin/python",
 	"files.exclude": {
@@ -11,6 +12,8 @@
 		"**/*.egg-info/": true
 	},
 
-	"python.analysis.stubPath": "./typings"
+	"python.analysis.stubPath": "./typings",
+	"python-envs.defaultEnvManager": "ms-python.python:conda",
+	"python-envs.defaultPackageManager": "ms-python.python:conda"
 
 }

@@ -1,181 +1,295 @@
-import time, csv
+"""World-model trainer with corrected timing contract.
+
+Timing (approved):
+    belief b_t = Transformer(obs[t], action[t-1], history)
+    ControllerTrunk.predict_reward(encode(b_t), action[t])  → reward[t]
+
+Full-sequence training processes all timesteps in a single Transformer
+pass after running perception once per frame.
+"""
+
+import time
+import csv
 from tqdm import tqdm
 from pathlib import Path
 from collections import deque
-from typing import Tuple, List, Dict
+from typing import Tuple, List, Dict, Optional
 
 import torch
 from torch import optim, Tensor
 from torch.utils.data import DataLoader
 import torch.nn.functional as F
 
-from rwm.config.config import ACTION_DIM, WRNN_HIDDEN_DIM
-from rwm.types import RolloutSample
+from rwm.config.config import ACTION_DIM
+from rwm.config.experiment_config import ExperimentConfig
+from rwm.types import RolloutSample, WorldModelOutput
 from rwm.models.rwm.model import ReducedWorldModel
+from rwm.utils.checkpointing import save_checkpoint
+
+
+def kl_normal(mu: Tensor, logvar: Tensor) -> Tensor:
+    kl = 0.5 * (logvar.exp() + mu.pow(2) - 1.0 - logvar)
+    return kl.mean(dim=-1).mean(dim=-1).mean()
 
 
 class WorldModelTrainer:
-	def __init__(
-		self,
-        loader: DataLoader[RolloutSample],
-		out_dir: Path,
-		sequence_len: int = 16,
-		epochs: int = 10,
-		batch_size: int = 32,
-		lr: float = 3e-4,
-		alpha: float = 1.0,
-		beta: float = 1.0,
-		 warmup_steps: int = 20,
-	) -> None:
-		self.loader  = loader
-		self.sequence_len = sequence_len
-		self.epochs, self.batch_size = epochs, batch_size
-		self.lr, self.alpha, self.beta = lr, alpha, beta
-		self.warmup_steps = warmup_steps
+    def __init__(
+        self,
+        train_loader: DataLoader[RolloutSample],
+        val_loader: Optional[DataLoader[RolloutSample]] = None,
+        out_dir: Path = Path("runs/rwm_train"),
+        sequence_len: int = 16,
+        epochs: int = 10,
+        batch_size: int = 32,
+        lr: float = 3e-4,
+        beta: float = 1.0,
+        config: Optional[ExperimentConfig] = None,
+        dataset_manifest_ref: Optional[str] = None,
+    ):
+        self.train_loader = train_loader
+        self.val_loader = val_loader
+        self.sequence_len = sequence_len
+        self.epochs = epochs
+        self.batch_size = batch_size
+        self.lr = lr
+        self.beta = beta
+        self.config = config
+        self.dataset_manifest_ref = dataset_manifest_ref
+        self._global_step = 0
+        self._last_train_reward_mean = 0.0
 
-		# Model, optimizer, device
-		self.device    = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-		self.model     = ReducedWorldModel(action_dim=ACTION_DIM).to(self.device)
-		self.optimizer = optim.Adam(self.model.parameters(), lr=self.lr)
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.model = ReducedWorldModel(action_dim=ACTION_DIM).to(self.device)
+        self.optimizer = optim.Adam(self.model.parameters(), lr=self.lr)
 
-		# Metrics state
-		self.out_dir = out_dir
-		out_dir.mkdir(exist_ok=True, parents=True)
-		self.metrics_file = out_dir / "metrics.csv"
-		self.best_loss = float("inf")
+        self.out_dir = out_dir
+        out_dir.mkdir(parents=True, exist_ok=True)
+        self.metrics_file = out_dir / "metrics.csv"
+        self.best_val_metric = float("inf")
 
+    # ------------------------------------------------------------------
+    # Training
+    # ------------------------------------------------------------------
 
-	def train_one_epoch(self) -> Tuple[float, float]:
-		self.model.train()
-		losses: List[float] = []
-		running_losses: deque[float] = deque(maxlen=20)
+    def train_one_epoch(self) -> Tuple[float, float, float, float]:
+        self.model.train()
+        total_losses: List[float] = []
+        mse_losses: List[float] = []
+        kl_losses: List[float] = []
+        running_losses: deque[float] = deque(maxlen=20)
+        reward_sum = 0.0
+        reward_count = 0
 
-		start = time.time()
-		progress = tqdm(self.loader, desc="Training", leave=False)
+        start = time.time()
+        progress = tqdm(self.train_loader, desc="Training", leave=False)
 
-		for step, batch in enumerate(progress):
-			loss = self._compute_batch_loss(batch)
-			self.optimizer.zero_grad()
-			loss.backward()						# type: ignore
-			self.optimizer.step()				# type: ignore
+        for step, batch in enumerate(progress):
+            rewards = batch["reward"][:, :self.sequence_len]
+            reward_sum += float(rewards.sum().item())
+            reward_count += rewards.numel()
 
-			loss_val = loss.item()
-			losses.append(loss_val)
-			running_losses.append(loss_val)
+            loss_total, loss_mse, loss_kl = self._compute_batch_loss(batch)
+            self.optimizer.zero_grad()
+            loss_total.backward()
+            self._log_grad_norms(step)
+            self.optimizer.step()
 
-			if step % 5 == 0:
-				running_loss_avg: float = sum(running_losses)/len(running_losses)
-				progress.set_postfix({ "avg_loss": f"{running_loss_avg:.4f}" })	# type: ignore
+            total_val = loss_total.item()
+            total_losses.append(total_val)
+            mse_losses.append(loss_mse.item())
+            kl_losses.append(loss_kl.item() if isinstance(loss_kl, torch.Tensor) and loss_kl.numel() > 0 else 0.0)
+            running_losses.append(total_val)
 
-		mean_loss: float = float(sum(losses) / len(losses))
-		return mean_loss, time.time() - start
+            if step % 5 == 0:
+                avg = sum(running_losses) / len(running_losses)
+                progress.set_postfix({"avg_loss": f"{avg:.4f}"})
 
+        self._last_train_reward_mean = reward_sum / max(1, reward_count)
+        n = len(total_losses)
+        return (
+            sum(total_losses) / max(1, n),
+            sum(mse_losses) / max(1, n),
+            sum(kl_losses) / max(1, n),
+            time.time() - start,
+        )
 
-	def _compute_batch_loss(self, batch: Dict[str, Tensor]) -> Tensor:
-		"""Compute average per-timestep MSE loss for a batch."""
-		B = batch["reward"].shape[0]
-		h = torch.zeros(B, WRNN_HIDDEN_DIM, device=self.device)
-		c = torch.zeros(B, WRNN_HIDDEN_DIM, device=self.device)
+    def _log_grad_norms(self, step: int) -> None:
+        """Compute and store per-block gradient norms after backward."""
+        blocks = {
+            "encoder": self.model.encoder,
+            "tokenizer": self.model.tokenizer,
+            "scorer": self.model.scorer,
+            "selector": self.model.selector,
+            "spatial_hd": self.model.spatial_hd,
+            "world_hd": self.model.world_hd,
+            "controller": self.model.controller,
+        }
+        norms = {}
+        for name, module in blocks.items():
+            total = 0.0
+            count = 0
+            for p in module.parameters():
+                if p.grad is not None:
+                    total += p.grad.norm().item() ** 2
+                    count += 1
+            norms[name] = (total ** 0.5) if count else 0.0
+        # Store for logging at epoch end.
+        if not hasattr(self, "_grad_norms"):
+            self._grad_norms: Dict[str, List[float]] = {k: [] for k in blocks}
+        for k, v in norms.items():
+            self._grad_norms[k].append(v)
 
-		obs = batch["obs"].to(self.device, non_blocking=True)		# (B, T, C, H, W)
-		act = batch["action"].to(self.device, non_blocking=True)	# (B, T, 3)
-		rew = batch["reward"].to(self.device, non_blocking=True)	# (B, T)
+    def _compute_batch_loss(
+        self, batch: Dict[str, Tensor],
+    ) -> Tuple[Tensor, Tensor, Tensor]:
+        """Full-sequence loss, returns (total_loss, reward_mse, kl_loss).
 
-		loss_seq: Tensor = torch.tensor(0.0, device=self.device)
-		a_prev = torch.zeros(B, ACTION_DIM, device=self.device)
-		for t in range(self.sequence_len):
-			img_t = obs[:, t]							# (B, C, H, W)
-			r_true_t = rew[:, t].unsqueeze(-1)			# (B, 1) for proper shape
-			force_keep = (t < self.warmup_steps)
-			h, c, r_pred_t, *_ = self.model(img=img_t, a_prev=a_prev, h_prev=h, c_prev=c, force_keep_input=force_keep)
-			loss_seq += F.mse_loss(r_pred_t, r_true_t)
-			a_prev = act[:, t]
+        prev_actions[:, 0] = zeros
+        prev_actions[:, t] = actions[:, t-1]
+        Transformer(obs[:, t], prev_actions[:, t], history) → belief_t
+        ControllerTrunk(belief_t, current_actions[:, t])    → reward_pred[t]
+        MSE(reward_pred[t], rewards[:, t])
+        """
+        obs = batch["obs"].to(self.device, non_blocking=True)       # (B, T, C, H, W)
+        act = batch["action"].to(self.device, non_blocking=True)    # (B, T, A)
+        rew = batch["reward"].to(self.device, non_blocking=True)    # (B, T)
 
-		return loss_seq / self.sequence_len
+        B, T = rew.shape
+        assert self.sequence_len <= T
 
+        prev_actions = torch.zeros(B, self.sequence_len, ACTION_DIM, device=self.device)
+        if self.sequence_len > 1:
+            prev_actions[:, 1:] = act[:, :self.sequence_len - 1]
+        current_actions = act[:, :self.sequence_len]
 
-	def evaluate(self) -> Dict[str, float]:
-		"""
-		Run one pass in eval mode, returning:
-			- mae_cum: mean absolute error on total reward per rollout
-			- mae_step: mean absolute error per timestep
-		"""
-		self.model.eval()
-		total_cum, total_step, total_count = 0.0, 0.0, 0
+        out: WorldModelOutput = self.model.forward_sequence(
+            obs[:, :self.sequence_len],
+            prev_actions, current_actions,
+            force_keep_input=True,
+        )
 
-		with torch.no_grad():
-			for batch in tqdm( self.loader, desc="Evaluating", leave=False ):
-				cum, step, count = self._compute_eval_batch(batch)
-				total_cum += cum
-				total_step += step
-				total_count += count
+        r_pred_seq = out.reward_pred_seq
+        r_true_seq = rew[:, :self.sequence_len]
+        loss_mse = F.mse_loss(r_pred_seq, r_true_seq)
 
-		return {
-			"mae_cum": total_cum / total_count,
-			"mae_step": total_step / (total_count * self.sequence_len),
-		}
-	
+        loss_kl = torch.zeros((), device=self.device)
+        if out.tok_mu is not None and out.tok_logvar is not None:
+            loss_kl = kl_normal(out.tok_mu, out.tok_logvar)
 
-	def _compute_eval_batch(self, batch: RolloutSample) -> Tuple[float, float, int]:
-		"""Compute (cum_error, step_error, batch_size) for one eval batch."""
-		B = batch["reward"].shape[0]
-		h = torch.zeros(B, WRNN_HIDDEN_DIM, device=self.device)
-		c = torch.zeros(B, WRNN_HIDDEN_DIM, device=self.device)
+        return loss_mse + self.beta * loss_kl, loss_mse, loss_kl
 
-		obs = batch["obs"].to(self.device)
-		act = batch["action"].to(self.device)
-		rew = batch["reward"].to(self.device)
+    # ------------------------------------------------------------------
+    # Validation
+    # ------------------------------------------------------------------
 
-		preds: List[Tensor] = []
-		for t in range(self.sequence_len):
-			h, c, r_pred, *_ = self.model(obs[:, t], act[:, t], h, c)
-			preds.append(r_pred.squeeze(-1))
+    def evaluate(self) -> Dict[str, float]:
+        loader = self.val_loader if self.val_loader is not None else self.train_loader
+        self.model.eval()
+        total_mse, total_abs_error, total_baseline_sse, total_count = 0.0, 0.0, 0.0, 0
 
-		r_pred_seq = torch.stack(preds, dim=1)
-		cum_error  = torch.abs(rew.sum(1)    - r_pred_seq.sum(1)).sum().item()
-		step_error = torch.abs(rew - r_pred_seq).sum().item()
-		return cum_error, step_error, B
-	
+        with torch.no_grad():
+            for batch in tqdm(loader, desc="Evaluating", leave=False):
+                obs = batch["obs"].to(self.device)
+                act = batch["action"].to(self.device)
+                rew = batch["reward"].to(self.device)
 
-	def fit(self) -> Path:
-		"""
-		Fixed-epoch fit:
-			- calls train_one_epoch()
-			- calls evaluate()
-			- logs via _log_and_checkpoint()
-			- saves best by train_loss
-		"""
-		for epoch in range(1, self.epochs + 1):
-			train_loss, elapsed = self.train_one_epoch()
-			eval_metrics = self.evaluate()
+                B, T = rew.shape
+                seq_len = min(self.sequence_len, T)
 
-			row: Dict[str, float] = {
-				"epoch": epoch,
-				"train_loss": train_loss,
-				"mae_cum": eval_metrics["mae_cum"],
-				"mae_step": eval_metrics["mae_step"],
-				"time": elapsed,
-			}
-			self.log_and_checkpoint(epoch, row)
+                prev_actions = torch.zeros(B, seq_len, ACTION_DIM, device=self.device)
+                if seq_len > 1:
+                    prev_actions[:, 1:] = act[:, :seq_len - 1]
+                current_actions = act[:, :seq_len]
 
-		return self.out_dir / "best_world_model.pt"
+                out = self.model.forward_sequence(
+                    obs[:, :seq_len], prev_actions, current_actions,
+                    force_keep_input=True,
+                )
+                r_pred = out.reward_pred_seq
+                r_true = rew[:, :seq_len]
+                total_mse += F.mse_loss(r_pred, r_true, reduction="sum").item()
+                total_abs_error += torch.abs(r_pred - r_true).sum().item()
+                total_baseline_sse += (
+                    (r_true - self._last_train_reward_mean).square().sum().item()
+                )
+                total_count += B * seq_len
 
+        mse = total_mse / max(1, total_count)
+        baseline_mse = total_baseline_sse / max(1, total_count)
+        return {
+            "val_mse": mse,
+            "val_mae": total_abs_error / max(1, total_count),
+            "mean_baseline_mse": baseline_mse,
+        }
 
-	def log_and_checkpoint(self, epoch: int, row: Dict[str, float]) -> None:
-		"""Append metrics row and save best model by train_loss."""
-		write_header = not self.metrics_file.exists()
-		with open(self.metrics_file, "a", newline="") as f:
-			writer = csv.DictWriter(f, fieldnames=list(row.keys()))
-			if write_header:
-				writer.writeheader()
-			writer.writerow(row)
+    # ------------------------------------------------------------------
+    # Main loop
+    # ------------------------------------------------------------------
 
-		loss = row["train_loss"]
-		if loss < self.best_loss:
-			self.best_loss = loss
-			torch.save(self.model.state_dict(), self.out_dir / "best_world_model.pt")			# type: ignore
-		else:
-			print(f"[Epoch {epoch}] skipped ckpt: loss={loss:.4f} best={self.best_loss:.4f}")
+    def fit(self) -> Path:
+        for epoch in range(1, self.epochs + 1):
+            train_total, train_mse, train_kl, elapsed = self.train_one_epoch()
+            val_metrics = self.evaluate()
 
-		print(f"[Epoch {epoch}] train_loss={loss:.4f} "
-				f"mae_cum={row['mae_cum']:.2f} time={row['time']:.1f}s")
+            row: Dict[str, float] = {
+                "epoch": epoch,
+                "train_total": train_total,
+                "train_mse": train_mse,
+                "train_kl": train_kl,
+                "val_mse": val_metrics["val_mse"],
+                "val_mae": val_metrics["val_mae"],
+                "baseline_mse": val_metrics["mean_baseline_mse"],
+                "time": elapsed,
+            }
+            gn = getattr(self, "_grad_norms", None)
+            if gn:
+                for k, vals in gn.items():
+                    if vals:
+                        row[f"gn_{k}"] = vals[-1]
+            self.log_and_checkpoint(epoch, row)
+
+        return self.out_dir / "best_world_model.pt"
+
+    def log_and_checkpoint(self, epoch: int, row: Dict[str, float]) -> None:
+        write_header = not self.metrics_file.exists()
+        with open(self.metrics_file, "a", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=list(row.keys()))
+            if write_header:
+                writer.writeheader()
+            writer.writerow(row)
+
+        self._global_step += 1
+        val_metric = row["val_mse"]
+        is_best = val_metric < self.best_val_metric
+
+        if is_best:
+            self.best_val_metric = val_metric
+            torch.save(self.model.state_dict(), self.out_dir / "best_world_model.pt")
+
+        if self.config is not None:
+            ckpt_metrics = {"val_mse": val_metric, "train_mse": row["train_mse"]}
+            if is_best:
+                save_checkpoint(
+                    path=self.out_dir / "checkpoint_best",
+                    model_state=self.model.state_dict(),
+                    optimizer_state=self.optimizer.state_dict(),
+                    config=self.config,
+                    global_step=self._global_step,
+                    epoch=epoch,
+                    metrics=ckpt_metrics,
+                    dataset_manifest_ref=self.dataset_manifest_ref,
+                )
+            save_checkpoint(
+                path=self.out_dir / "checkpoint_latest",
+                model_state=self.model.state_dict(),
+                optimizer_state=self.optimizer.state_dict(),
+                config=self.config,
+                global_step=self._global_step,
+                epoch=epoch,
+                metrics=ckpt_metrics,
+                dataset_manifest_ref=self.dataset_manifest_ref,
+            )
+
+        if not is_best:
+            print(f"[Epoch {epoch}] skipped ckpt: val_mse={val_metric:.4f} best={self.best_val_metric:.4f}")
+        print(f"[Epoch {epoch}] train_mse={row['train_mse']:.4f} train_kl={row['train_kl']:.4f} val_mse={val_metric:.4f} time={row['time']:.1f}s")

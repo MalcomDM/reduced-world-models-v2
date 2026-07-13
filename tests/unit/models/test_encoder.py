@@ -2,7 +2,7 @@ import pytest
 import torch
 from torch import Tensor
 
-from rwm.models.rwm_deterministic.encoder import Encoder
+from rwm.models.rwm.encoder import Encoder
 from rwm.config.config import INPUT_DIM, CONV_FILTERS, FEATURE_MAP_SIZE
 
 

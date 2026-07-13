@@ -2,7 +2,7 @@ import pytest
 import torch, math
 from typing import Set, Tuple
 
-from rwm.models.rwm_deterministic.topk_gumbel_selector import TopKGumbelSelector
+from rwm.models.rwm.topk_gumbel_selector import TopKGumbelSelector
 
 
 @pytest.mark.models

@@ -34,13 +34,12 @@ def test_world_model_trainer_end_to_end(tmp_path: Path):
 	# 3) Instantiate & run the trainer for 2 epochs
 	out_dir = tmp_path / "runs"
 	trainer = WorldModelTrainer(
-		loader=loader,
+		train_loader=loader,
 		out_dir=out_dir,
 		sequence_len=16,
 		epochs=2,
 		batch_size=4,
 		lr=1e-3,
-		alpha=1.0,
 		beta=0.1,
 	)
 	best_model_path = trainer.fit()

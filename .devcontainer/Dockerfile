@@ -1,4 +1,4 @@
-# Base: Official PyTorch with CUDA 12.6
+# Base: Official PyTorch with CUDA 12.8
 FROM pytorch/pytorch:2.7.0-cuda12.8-cudnn9-runtime
 
 # Avoid debconf errors

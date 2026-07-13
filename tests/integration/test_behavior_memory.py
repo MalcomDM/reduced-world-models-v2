@@ -95,38 +95,20 @@ def test_save_and_load(tmp_path: Path, scratch_dir: str, dummy_rollout: Rollout)
 
 
 @pytest.mark.memory
-def test_recompute_keys(scratch_dir: str, dummy_rollout: Rollout):
-	bm = BehaviorMemory(scratch_dir, max_size=10)
-	obs, acts = make_obs_act()
+def test_recompute_keys_raises_not_implemented(
+    scratch_dir: str, dummy_rollout: Rollout,
+):
+    """recompute_keys now raises NotImplementedError because it uses the
+    legacy LSTM interface which is incompatible with the current
+    CausalTransformer-based model."""
+    bm = BehaviorMemory(scratch_dir, max_size=10)
+    obs, acts = make_obs_act()
 
-	# Two distinct starting latents
-	h0 = torch.zeros(1, 16)
-	h1 = torch.ones(1, 16)
-	bm.add(h0, dummy_rollout.cum_reward, obs, acts)
-	bm.add(h1, dummy_rollout.cum_reward, obs, acts)
-	old_keys = set(bm.states.keys())
-	assert len(old_keys) == 2
+    h0 = torch.zeros(1, 16)
+    bm.add(h0, dummy_rollout.cum_reward, obs, acts)
+    assert len(bm) == 1
 
-	# Dummy model that maps any obs-> same h=ones
-	class DummyModel(torch.nn.Module):
-		def __init__(self):
-			super().__init__()		# type: ignore
-			self.dummy = torch.nn.Parameter(torch.zeros(1))
-			self.world_rnn = type("", (), {"rnn_cell": type("", (), {"hidden_size":16})()})()
-               
-		def forward(
-				self, img:Tensor, a:Tensor, h:Tensor, c:Tensor, force_keep_input:bool
-		) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
-			# forces h to uniform ones
-			return torch.ones_like(h), c, c, c, c
-	model = DummyModel()
-
-	# recompute: all old keys map to same new key
-	bm.recompute_keys(model)  # dummy preprocess
-	new_keys = set(bm.states.keys())
-	assert len(new_keys) == 1
-
-	# reencode_count should have incremented
-	info = next(iter(bm.states.values()))
-	assert info["reencode_count"] == 2
+    dummy_model = torch.nn.Module()
+    with pytest.raises(NotImplementedError, match="legacy LSTM"):
+        bm.recompute_keys(dummy_model)
 

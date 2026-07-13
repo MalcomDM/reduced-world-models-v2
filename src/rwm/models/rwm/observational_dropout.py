@@ -2,12 +2,12 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 
-from src.rwm.config.config import TOKEN_DIM
+from rwm.config.config import TOKEN_DIM
 
 
 class ObservationalDropout(nn.Module):
 	def __init__(self, p: float = 0.8, mode: str = "zero"):
-		super().__init__()
+		super().__init__() # type: ignore
 		self.p = p
 		self.mode = mode
 		if mode == "token":

@@ -1,15 +1,24 @@
+"""High-level world-model training loop with episode-safe train/val split."""
+
 import psutil
 from tqdm import trange
 from pathlib import Path
-from typing import List, Dict
+from typing import List, Dict, Optional
 
 import torch
-from torch.utils.data import ConcatDataset, Dataset, DataLoader
+from torch.utils.data import DataLoader
 
-from rwm.types import RolloutSample
-from rwm.config.config import ERROR_THRESHOLD
-from rwm.data.rollout_dataset import RolloutDataset
+from rwm.data.rollout_dataset import (
+    build_train_val_datasets,
+    _collect_npz_files,
+)
 from rwm.trainers.deterministic.world_model_trainer import WorldModelTrainer
+from rwm.config.experiment_config import ExperimentConfig
+from rwm.utils.dataset_manifest import (
+    build_dataset_manifest,
+    save_manifest,
+    validate_manifest,
+)
 
 
 def train_world_model_loop(
@@ -19,79 +28,106 @@ def train_world_model_loop(
     batch_size: int = 32,
     max_epochs: int = 50,
     image_size: int = 64,
-    alpha: float = 1.0,
     beta: float = 1.0,
-    error_threshold: float = ERROR_THRESHOLD,
-	warmup_steps: int=20,
+    warmup_steps: int = 20,
+    val_ratio: float = 0.2,
+    config: Optional[ExperimentConfig] = None,
 ) -> Path:
-	"""
-	1) Builds a DataLoader from all scenario folders in `rollout_dirs`.
-	2) Instantiates WorldModelTrainer with that loader.
-	3) Runs epoch-by-epoch train → eval → log, stopping when mae_cum < error_threshold.
-	"""
-	# — build datasets & loader (separation of concerns) —
-	datasets: List[Dataset[RolloutSample]] = [
-		RolloutDataset(d, sequence_len=sequence_len, image_size=image_size)
-		for d in rollout_dirs
-	]
-	full_dataset: Dataset[RolloutSample] = ConcatDataset(datasets)
-	loader: DataLoader[RolloutSample] = DataLoader(
-		full_dataset,
-		batch_size=batch_size,
-		shuffle=True,
-		drop_last=True,
-		num_workers=4,
-		pin_memory=True, 
-	)
+    """
+    Builds train/validation datasets using episode-safe file-level split,
+    then runs epoch-by-epoch training with held-out validation.
+    """
+    # Merge all scenario directories into one root for the dataset.
+    # create a synthetic root that includes all files from all scenarios
+    all_files: List[Path] = []
+    for d in rollout_dirs:
+        all_files.extend(_collect_npz_files(d))
 
-	# Use WorldModelTrainer
-	trainer = WorldModelTrainer(
-		loader=loader,
-		out_dir=out_dir,
-		sequence_len=sequence_len,
-		batch_size=batch_size,
-		epochs=max_epochs,
+    if len(all_files) < 2:
+        raise ValueError(
+            f"Need at least 2 rollout files for train/val split; "
+            f"found {len(all_files)} across {len(rollout_dirs)} scenario dirs."
+        )
+
+    rng = __import__("numpy").random.RandomState(42)
+    rng.shuffle(all_files)
+    n_val = max(1, int(len(all_files) * val_ratio))
+    train_files, val_files = all_files[n_val:], all_files[:n_val]
+
+    from rwm.data.rollout_dataset import RolloutDataset
+    train_ds = RolloutDataset.from_file_list(
+        train_files, sequence_len=sequence_len, image_size=image_size,
+    )
+    val_ds = RolloutDataset.from_file_list(
+        val_files, sequence_len=sequence_len, image_size=image_size,
+    )
+
+    train_loader = DataLoader(
+        train_ds, batch_size=batch_size, shuffle=True,
+        drop_last=True, num_workers=4, pin_memory=True,
+    )
+    val_loader = DataLoader(
+        val_ds, batch_size=batch_size, shuffle=False,
+        drop_last=False, num_workers=2, pin_memory=True,
+    )
+
+    # Dataset manifest
+    manifest_ref: Optional[str] = None
+    if config is not None:
+        try:
+            manifest = build_dataset_manifest(
+                data_root=rollout_dirs[0].parent if len(rollout_dirs) == 1
+                else rollout_dirs[0],
+                sequence_len=sequence_len,
+                image_size=image_size,
+                val_ratio=val_ratio,
+            )
+            issues = validate_manifest(manifest)
+            if issues:
+                print(f"Warning: dataset manifest issues: {issues}")
+            manifest_path = out_dir / "dataset_manifest.json"
+            save_manifest(manifest, manifest_path)
+            manifest_ref = manifest_path.name
+        except Exception as exc:
+            print(f"Warning: could not build dataset manifest: {exc}")
+
+    trainer = WorldModelTrainer(
+        train_loader=train_loader,
+        val_loader=val_loader,
+        out_dir=out_dir,
+        sequence_len=sequence_len,
+        epochs=max_epochs,
+        batch_size=batch_size,
         lr=3e-4,
-		alpha=alpha,
-		beta=beta,
-		warmup_steps=warmup_steps
-	)
+        beta=beta,
+        warmup_steps=warmup_steps,
+        config=config,
+        dataset_manifest_ref=manifest_ref,
+    )
 
-	for epoch in trange(1, max_epochs + 1, desc="Epochs"):
-		
-		if torch.cuda.is_available():						# — reset GPU peak stats —
-			torch.cuda.reset_peak_memory_stats()
+    for epoch in trange(1, max_epochs + 1, desc="Epochs"):
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
 
-		# — train one epoch —
-		train_loss, elapsed = trainer.train_one_epoch()
+        train_loss, elapsed = trainer.train_one_epoch()
 
-		# — now capture resource usage —
-		gpu_peak = (
-			torch.cuda.max_memory_allocated() / 1e9
-			if torch.cuda.is_available() else 0.0
-		)
-		proc = psutil.Process()
-		cpu_rss = proc.memory_info().rss / 1e9
+        gpu_peak = (
+            torch.cuda.max_memory_allocated() / 1e9
+            if torch.cuda.is_available() else 0.0
+        )
+        proc = psutil.Process()
+        cpu_rss = proc.memory_info().rss / 1e9
 
-		if epoch % 5 == 0 or epoch == 1 or epoch == max_epochs or train_loss < error_threshold:
-			eval_metrics = trainer.evaluate()
-		else:
-			eval_metrics = {"mae_cum": float("inf"), "mae_step": float("inf")}
+        val_metrics = trainer.evaluate()
 
-		# merge into one row
-		row: Dict[str, float] = {
-			"epoch": epoch,
-			"train_loss": train_loss,
-			"mae_cum": eval_metrics["mae_cum"],
-			"mae_step": eval_metrics["mae_step"],
-			"time": elapsed,
-			"gpu_mem_peak_gb": gpu_peak,
-			"cpu_mem": cpu_rss
-		}
-		trainer.log_and_checkpoint(epoch, row)
+        row: Dict[str, float] = {
+            "epoch": epoch,
+            "train_loss": train_loss,
+            "val_mse": val_metrics["val_mse"],
+            "time": elapsed,
+            "gpu_mem_peak_gb": gpu_peak,
+            "cpu_mem": cpu_rss,
+        }
+        trainer.log_and_checkpoint(epoch, row)
 
-		if train_loss < error_threshold:
-			break
-
-	return out_dir / "best_world_model.pt"
-
+    return out_dir / "best_world_model.pt"

@@ -2,12 +2,12 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 
-from rwm.config.config import ACTION_DIM, WRNN_HIDDEN_DIM
+from rwm.config.config import ACTION_DIM, WORLD_STATE_DIM
 
 
 class Controller(nn.Module):
     def __init__(self,
-		hidden_dim: int = WRNN_HIDDEN_DIM,
+		hidden_dim: int = WORLD_STATE_DIM,
 		action_dim: int = ACTION_DIM
     ) -> None:
         super().__init__()									# type: ignore[reportUnknownMemberType]

@@ -1,7 +1,7 @@
 import pytest
 import torch
-from rwm.models.rwm_deterministic.world_rnn import WorldRNN
-from rwm.config.config import WRNN_HIDDEN_DIM, PRNN_HIDDEN_DIM, OBSERVATIONAL_DROPOUT, ACTION_DIM
+from rwm.models.rwm.world_rnn import WorldRNN
+from rwm.config.config import WORLD_STATE_DIM, PRNN_HIDDEN_DIM, OBSERVATIONAL_DROPOUT, ACTION_DIM
 
 
 @pytest.mark.models
@@ -10,8 +10,8 @@ def test_world_rnn_output_shapes_and_determinism() -> None:
     model.eval()
 
     B = 3
-    h_prev = torch.zeros(B, WRNN_HIDDEN_DIM)
-    c_prev = torch.zeros(B, WRNN_HIDDEN_DIM)
+    h_prev = torch.zeros(B, WORLD_STATE_DIM)
+    c_prev = torch.zeros(B, WORLD_STATE_DIM)
     x_spatial = torch.randn(B, PRNN_HIDDEN_DIM)
     a_prev = torch.randn(B, ACTION_DIM)
 
@@ -19,8 +19,8 @@ def test_world_rnn_output_shapes_and_determinism() -> None:
     h1, c1, r1 = model(h_prev, c_prev, x_spatial, a_prev, force_keep_input=True)
     h2, c2, r2 = model(h_prev, c_prev, x_spatial, a_prev, force_keep_input=True)
 
-    assert h1.shape == (B, WRNN_HIDDEN_DIM)
-    assert c1.shape == (B, WRNN_HIDDEN_DIM)
+    assert h1.shape == (B, WORLD_STATE_DIM)
+    assert c1.shape == (B, WORLD_STATE_DIM)
     assert r1.shape == (B, 1)
     assert torch.allclose(h1, h2) and torch.allclose(c1, c2) and torch.allclose(r1, r2)
 
@@ -39,8 +39,8 @@ def test_world_rnn_dropout_behavior() -> None:
 
     B = 4
     # random previous hidden/cell
-    h_prev = torch.randn(B, WRNN_HIDDEN_DIM)
-    c_prev = torch.randn(B, WRNN_HIDDEN_DIM)
+    h_prev = torch.randn(B, WORLD_STATE_DIM)
+    c_prev = torch.randn(B, WORLD_STATE_DIM)
     # spatial and action both zero
     zero_spatial = torch.zeros(B, PRNN_HIDDEN_DIM)
     zero_action  = torch.zeros(B, ACTION_DIM)
@@ -65,16 +65,16 @@ def test_world_rnn_gradient_flow() -> None:
     model.train()
 
     B = 2
-    h_prev = torch.randn(B, WRNN_HIDDEN_DIM, requires_grad=True)
-    c_prev = torch.randn(B, WRNN_HIDDEN_DIM, requires_grad=True)
+    h_prev = torch.randn(B, WORLD_STATE_DIM, requires_grad=True)
+    c_prev = torch.randn(B, WORLD_STATE_DIM, requires_grad=True)
     x_spatial = torch.randn(B, PRNN_HIDDEN_DIM, requires_grad=True)
     a_prev = torch.randn(B, ACTION_DIM, requires_grad=True)
 
     # Forward pass
     h_new, c_new, r_pred = model(h_prev, c_prev, x_spatial, a_prev)
     # Assert output shapes
-    assert h_new.shape == (B, WRNN_HIDDEN_DIM)
-    assert c_new.shape == (B, WRNN_HIDDEN_DIM)
+    assert h_new.shape == (B, WORLD_STATE_DIM)
+    assert c_new.shape == (B, WORLD_STATE_DIM)
     assert r_pred.shape == (B, 1)
 
     # Backward on reward prediction only
@@ -93,8 +93,8 @@ def test_observational_dropout_full_zero():
     model = WorldRNN(action_dim=ACTION_DIM, dropout_prob=1.0)
     model.train()
     B  = 2
-    h0 = torch.randn(B, WRNN_HIDDEN_DIM)
-    c0 = torch.randn(B, WRNN_HIDDEN_DIM)
+    h0 = torch.randn(B, WORLD_STATE_DIM)
+    c0 = torch.randn(B, WORLD_STATE_DIM)
     x  = torch.randn(B, PRNN_HIDDEN_DIM)
     a  = torch.randn(B, ACTION_DIM)
 

@@ -3,15 +3,15 @@ import torch.nn as nn
 from torch import Tensor
 from typing import Tuple
 
-from rwm.config.config import PRNN_HIDDEN_DIM, WRNN_HIDDEN_DIM
+from rwm.config.config import PRNN_HIDDEN_DIM, WORLD_STATE_DIM
 
 
 class WorldRNN(nn.Module):
 	def __init__(self, action_dim: int, dropout_prob: float = 0.8) -> None:
 		super().__init__()																# type: ignore[reportUnknownMemberType]
-		# self.rnn_cell = nn.GRUCell(PRNN_HIDDEN_DIM + action_dim, WRNN_HIDDEN_DIM)
-		self.rnn_cell 			 = nn.LSTMCell(PRNN_HIDDEN_DIM + action_dim, WRNN_HIDDEN_DIM)
-		self.reward_head 		 = nn.Linear(WRNN_HIDDEN_DIM, 1)
+		# self.rnn_cell = nn.GRUCell(PRNN_HIDDEN_DIM + action_dim, WORLD_STATE_DIM)
+		self.rnn_cell 			 = nn.LSTMCell(PRNN_HIDDEN_DIM + action_dim, WORLD_STATE_DIM)
+		self.reward_head 		 = nn.Linear(WORLD_STATE_DIM, 1)
 		self.dropout_prob: float = dropout_prob
 
 

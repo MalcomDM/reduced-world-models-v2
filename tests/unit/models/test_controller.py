@@ -3,7 +3,7 @@ import torch
 from torch import Tensor
 
 from rwm.models.controller.model import Controller
-from rwm.config.config import WRNN_HIDDEN_DIM, ACTION_DIM
+from rwm.config.config import WORLD_STATE_DIM, ACTION_DIM
 
 
 @pytest.mark.models
@@ -12,11 +12,11 @@ def test_controller_output_shape_and_range() -> None:
     Controller should map (B, hidden_dim) → (B, action_dim),
     and outputs must lie within [-1, 1].
     """
-    model = Controller(hidden_dim=WRNN_HIDDEN_DIM, action_dim=ACTION_DIM)
+    model = Controller(hidden_dim=WORLD_STATE_DIM, action_dim=ACTION_DIM)
     model.eval()
 
     for B in [1, 4]:
-        h: Tensor = torch.randn(B, WRNN_HIDDEN_DIM)
+        h: Tensor = torch.randn(B, WORLD_STATE_DIM)
         with torch.no_grad():
             actions: Tensor = model(h)
 
@@ -32,7 +32,7 @@ def test_controller_determinism_in_eval() -> None:
     model = Controller()
     model.eval()
 
-    h = torch.randn(2, WRNN_HIDDEN_DIM)
+    h = torch.randn(2, WORLD_STATE_DIM)
     with torch.no_grad():
         a1 = model(h)
         a2 = model(h)
@@ -47,7 +47,7 @@ def test_controller_gradient_flow() -> None:
     model.train()
 
     B = 3
-    h: Tensor = torch.randn(B, WRNN_HIDDEN_DIM)
+    h: Tensor = torch.randn(B, WORLD_STATE_DIM)
     actions: Tensor = model(h)
     loss: Tensor = actions.mean()
     loss.backward()	# type: ignore

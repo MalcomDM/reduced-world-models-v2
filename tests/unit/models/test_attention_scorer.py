@@ -2,7 +2,7 @@ import pytest, torch, math
 from torch import Tensor
 
 from rwm.config.config import TOKEN_DIM, QUERY_DIM
-from rwm.models.rwm_deterministic.attention_scorer import AttentionScorer
+from rwm.models.rwm.attention_scorer import AttentionScorer
 
 
 @pytest.mark.models

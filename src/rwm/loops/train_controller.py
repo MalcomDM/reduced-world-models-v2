@@ -175,48 +175,21 @@ class ControllerTrainer:
 
 
 	def train_on_memory(self, batch_size: int) -> float:
+		"""Train controller from behavior-memory replay.
+
+		.. deprecated::
+		   This method calls the legacy LSTM interface (``h_prev``,
+		   ``c_prev``, ``world_rnn.rnn_cell``) which is incompatible
+		   with the current ``CausalTransformer``-based world model.
+
+		   The memory-based controller training path will be replaced
+		   by Actor-Critic training in Stage 4 and is not maintained
+		   during Stages 1-3.
 		"""
-		Sample up to batch_size behaviors from memory and do one gradient step.
-		Returns the total training loss on that memory batch.
-		"""
-		keys = self.memory.sample(batch_size)
-		if not keys:
-			return 0.0
-
-		losses: List[Tensor] = []
-		self.controller.train()
-		self.optimizer.zero_grad()
-
-
-		for key in tqdm(keys, desc="Replaying memory"):
-			path = self.memory.get_situation_path(key)
-			obs_seq, act_seq = self.memory.load_obs_and_act(path)
-
-			# warmup to get latent states
-			h = torch.zeros(1, self.model.world_rnn.rnn_cell.hidden_size, device=self.device)
-			c = torch.zeros_like(h)
-			latents: List[Tensor] = []
-			true_acts: List[Tensor] = []
-
-			for i in range(len(obs_seq)):
-				img_t = preprocess_obs(obs_seq[i]).to(self.device, dtype=next(self.model.parameters()).dtype)
-				a_prev = torch.from_numpy(act_seq[i:i+1]).to(self.device).float()			# type: ignore
-				with torch.no_grad():
-					h, c, *_ = self.model.forward(img=img_t,
-													a_prev=a_prev,
-													h_prev=h, c_prev=c,
-													force_keep_input=True)
-					if i >= self.simulator.warmup_steps:
-						latents.append(h)
-						true_acts.append(a_prev)
-
-			# compute MSE loss on the rollout’s actions
-			for h_t, a_t in zip(latents, true_acts):
-				pred = self.controller(h_t)
-				losses.append(nn.functional.mse_loss(pred, a_t.detach()))
-
-		# single backward pass
-		total_loss = torch.stack(losses).sum()
-		total_loss.backward()					# type: ignore
-		self.optimizer.step()					# type: ignore
-		return float(total_loss.item())
+		raise NotImplementedError(
+			"train_on_memory uses the legacy LSTM world_rnn interface "
+			"which is not available in the CausalTransformer-based "
+			"ReducedWorldModel.\n\n"
+			"This path will be replaced by Actor-Critic training "
+			"(Stage 4) and is intentionally disabled."
+		)

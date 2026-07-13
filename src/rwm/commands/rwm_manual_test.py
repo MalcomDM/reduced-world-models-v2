@@ -1,137 +1,139 @@
-import sys, typer, csv
-import torch, pygame
-import numpy as np
-import matplotlib.pyplot as plt
-from PIL import Image
+"""Interactive human reward-prediction evaluation for the current world model."""
+
+from __future__ import annotations
+
+import csv
 from pathlib import Path
-from numpy.typing import NDArray
-from typing import Any
+from typing import Optional
 
 import gymnasium as gym
-from gymnasium.core import Env
+import numpy as np
+import torch
+import typer
+from PIL import Image
 
+from rwm.config.config import ACTION_DIM, INPUT_DIM
 from rwm.models.rwm.model import ReducedWorldModel
 from rwm.policies.human_policy import HumanPolicy
-from rwm.config.config import ACTION_DIM, WRNN_HIDDEN_DIM, INPUT_DIM, M_WARMUP
+from rwm.utils.checkpointing import load_checkpoint
 
 
-def load_model(checkpoint_path: str, device: torch.device) -> ReducedWorldModel:
-	model = ReducedWorldModel(action_dim=ACTION_DIM, dropout_prob=0.85)
-	ckpt = torch.load(checkpoint_path, map_location=device)
-	state = ckpt.get("model_state", ckpt)
-	model.load_state_dict(state)
-	return model.to(device).eval()
+def preprocess_obs(obs: np.ndarray, device: torch.device) -> torch.Tensor:
+    """Convert a CarRacing RGB frame to the model's ``(1, 3, 64, 64)`` input."""
+    image = Image.fromarray(obs).resize(INPUT_DIM[:2])
+    array = np.asarray(image, dtype=np.float32) / 255.0
+    return torch.from_numpy(array).permute(2, 0, 1).unsqueeze(0).to(device)
 
 
-def preprocess_obs(obs: NDArray[np.uint8], device: torch.device) -> torch.Tensor:
-	img = Image.fromarray(obs).resize(INPUT_DIM[:2])
-	img = np.array(img, dtype=np.float32) / 255.0
-	tensor = torch.from_numpy(img).permute(2, 0, 1).unsqueeze(0)  # type: ignore (1, C, H, W)
-	return tensor.to(device)
+def load_model(checkpoint_path: Path, device: torch.device) -> ReducedWorldModel:
+    """Load a structured Stage-2 checkpoint into the active architecture."""
+    checkpoint = load_checkpoint(checkpoint_path, map_location=str(device))
+    model = ReducedWorldModel(action_dim=ACTION_DIM)
+    model.load_state_dict(checkpoint["model_state"])
+    return model.to(device).eval()
 
 
-app = typer.Typer()
-
-
-def main(ckpt: Path, env_name: str):
-
-	device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-	if not ckpt.exists():
-		print(f"❌ ERROR: checkpoint not found at {str(ckpt)}", file=sys.stderr)
-		sys.exit(1)
-
-	model = load_model(str(ckpt), device)
-	env: Env[Any, Any] = gym.make(env_name, render_mode="human", continuous=True)	# type: ignore 
-	obs, _ = env.reset()
-
-	policy = HumanPolicy()
-	policy.reset()
-	pygame.init()
-	clock = pygame.time.Clock()
-
-	# Plotting
-	plt.ion()										# type: ignore 
-	fig, ax = plt.subplots(figsize=(6, 3))			# type: ignore 
-	ax.set_xlabel("Step")							# type: ignore 
-	ax.set_ylabel("Reward")							# type: ignore 
-	ax.set_title("Real vs Predicted Reward")		# type: ignore 
-	line_true, = ax.plot([], [], label="True")		# type: ignore 
-	line_pred, = ax.plot([], [], label="Pred")		# type: ignore 
-	ax.legend()										# type: ignore 
-	plt.show()										# type: ignore 
-
-	# World Model state
-	h_t = torch.zeros(1, WRNN_HIDDEN_DIM, device=device)
-	c_t = torch.zeros(1, WRNN_HIDDEN_DIM, device=device)
-	a_prev = torch.zeros(1, ACTION_DIM, device=device)
-
-	r_true_list: list[float] = []
-	r_pred_list: list[float] = []
-	t = 0
-
-	while policy.is_running():
-		action = policy.act(obs)
-		frame_tensor = preprocess_obs(obs, device)
-
-		force_keep = t < M_WARMUP
-		with torch.no_grad():
-			h_t, c_t, r_pred_t, *_ = model(img=frame_tensor, a_prev=a_prev, h_prev=h_t, c_prev=c_t, force_keep_input=force_keep)
-		r_pred = float(r_pred_t.item())
-
-		next_obs, r_true, terminated, truncated, _ = env.step(action)
-
-		r_true_list.append(float(r_true))
-		r_pred_list.append(r_pred)
-
-		xs = np.arange(len(r_true_list))
-		line_true.set_data(xs, r_true_list)
-		line_pred.set_data(xs, r_pred_list)
-		ax.relim()
-		ax.autoscale_view()
-		fig.canvas.draw()														# type: ignore 
-		fig.canvas.flush_events()
-
-		obs = next_obs
-		a_prev = torch.from_numpy(action).unsqueeze(0).to(device)				# type: ignore 
-		t += 1
-
-		if terminated or truncated:
-			obs, _ = env.reset()
-			h_t.zero_(); c_t.zero_()
-			t = 0
-			r_true_list.clear()
-			r_pred_list.clear()
-
-		clock.tick(60)
-
-	if r_true_list:
-		save_reward_log(Path("reward_log.csv"), r_true_list, r_pred_list)
-
-	# Cleanup
-	env.close()
-	pygame.quit()
-	plt.ioff()					# type: ignore 
-	plt.show()					# type: ignore
-
-
-def save_reward_log(path: Path, r_true_list: list[float], r_pred_list: list[float]) -> None:
-    assert len(r_true_list) == len(r_pred_list)
+def _save_reward_log(path: Path, rows: list[tuple[int, int, float, float]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["step", "r_true", "r_pred"])
-        for i, (rt, rp) in enumerate(zip(r_true_list, r_pred_list)):
-            writer.writerow([i, rt, rp])
-    print(f"✅ Saved reward log to {path}")
+        writer.writerow(["episode", "step", "reward_true", "reward_pred"])
+        writer.writerows(rows)
 
 
-@app.command()
 def run(
-    ckpt: Path = typer.Argument(..., exists=True, help="Path to the trained world model checkpoint"),
-    env_name: str = typer.Option("CarRacing-v3", help="Gymnasium environment name")
+    ckpt: Path = typer.Argument(..., exists=True, help="Structured world-model checkpoint (.pt)"),
+    env_name: str = typer.Option("CarRacing-v3", help="Gymnasium environment name"),
+    log_path: Path = typer.Option(Path("runs/manual_reward_eval.csv"), help="CSV output path"),
+    fps: int = typer.Option(60, min=1, help="Maximum interactive loop rate"),
+    max_steps: Optional[int] = typer.Option(None, min=1, help="Stop after this many total steps"),
 ) -> None:
-	main(ckpt, env_name)
+    """Drive CarRacing and plot predicted versus immediate real reward live.
 
+    At each step the human selects ``action[t]`` from ``obs[t]``.  The model
+    receives ``obs[t]``, ``action[t-1]`` and ``action[t]``, predicting the
+    reward returned by that same subsequent ``env.step(action[t])``.
+    """
+    import matplotlib.pyplot as plt
+    import pygame
 
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = load_model(ckpt, device)
+    env = gym.make(env_name, render_mode="human", continuous=True)
+    # CarRacing creates its SDL video context lazily on reset.  Do this before
+    # the keyboard policy touches pygame's event queue.
+    obs, _ = env.reset()
+    policy = HumanPolicy()
+    policy.reset()
+    clock = pygame.time.Clock()
 
-if __name__ == "__main__":
-	app()
+    plt.ion()
+    fig, ax = plt.subplots(figsize=(7, 3.5))
+    ax.set(xlabel="Step within episode", ylabel="Immediate reward", title="Real vs predicted reward")
+    (line_true,) = ax.plot([], [], label="Real", color="tab:blue")
+    (line_pred,) = ax.plot([], [], label="Predicted", color="tab:orange")
+    ax.legend()
+    plt.show(block=False)
+
+    prev_action = torch.zeros(1, ACTION_DIM, device=device)
+    history: Optional[torch.Tensor] = None
+    lengths: Optional[torch.Tensor] = None
+    true_rewards: list[float] = []
+    predicted_rewards: list[float] = []
+    rows: list[tuple[int, int, float, float]] = []
+    episode, step, total_steps = 0, 0, 0
+
+    try:
+        while policy.is_running() and (max_steps is None or total_steps < max_steps):
+            # The current action is deliberately chosen before prediction: it
+            # conditions r[t] while only a[t-1] enters the causal belief.
+            action = policy.act(obs)
+            current_action = torch.as_tensor(action, dtype=torch.float32, device=device).unsqueeze(0)
+            frame = preprocess_obs(obs, device)
+
+            with torch.no_grad():
+                output = model(
+                    img=frame,
+                    prev_action=prev_action,
+                    current_action=current_action,
+                    history=history,
+                    lengths=lengths,
+                )
+            prediction = float(output.reward_pred.squeeze().item())
+            next_obs, reward, terminated, truncated, _ = env.step(action)
+
+            true_rewards.append(float(reward))
+            predicted_rewards.append(prediction)
+            rows.append((episode, step, float(reward), prediction))
+            xs = np.arange(len(true_rewards))
+            line_true.set_data(xs, true_rewards)
+            line_pred.set_data(xs, predicted_rewards)
+            ax.relim()
+            ax.autoscale_view()
+            fig.canvas.draw_idle()
+            fig.canvas.flush_events()
+
+            history, lengths = output.history, output.lengths
+            prev_action = current_action
+            obs = next_obs
+            step += 1
+            total_steps += 1
+
+            if terminated or truncated:
+                obs, _ = env.reset()
+                prev_action = torch.zeros(1, ACTION_DIM, device=device)
+                history, lengths = None, None
+                true_rewards.clear()
+                predicted_rewards.clear()
+                episode += 1
+                step = 0
+
+            clock.tick(fps)
+    finally:
+        _save_reward_log(log_path, rows)
+        env.close()
+        pygame.quit()
+        plt.ioff()
+        plt.close(fig)
+
+    typer.echo(f"Saved {len(rows)} aligned reward pairs to {log_path}")
