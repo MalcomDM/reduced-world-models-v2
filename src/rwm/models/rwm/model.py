@@ -9,7 +9,7 @@ Timing contract (approved):
     ControllerTrunk.predict_reward(shared_repr, action[t])
                                   → reward[t] (= r_{t+1})
 
-Reference: ``docs/transition_contract.md``
+Reference: ``docs/contracts/transition_contract.md``
 """
 
 from typing import Optional, Tuple
@@ -76,16 +76,32 @@ class ReducedWorldModel(nn.Module):
         self,
         action_dim: int = ACTION_DIM,
         dropout_prob: float = OBSERVATIONAL_DROPOUT,
+        reward_head_kind: str = "linear",
+        reward_head_hidden_dim: int = 32,
+        selection_mode: str = "learned",
+        selection_k: int = 8,
+        selection_seed: int = 0,
     ):
         super().__init__()
+        self._reward_head_kind = reward_head_kind
+        self._reward_head_hidden_dim = reward_head_hidden_dim
+        self._selection_mode = selection_mode
+        self._selection_k = selection_k
         self.encoder = Encoder()
         self.tokenizer = TokenizationHead()
         self.scorer = AttentionScorer()
-        self.selector = TopKGumbelSelector()
+        self.selector = TopKGumbelSelector(
+            k=selection_k, selection_mode=selection_mode,
+            selection_seed=selection_seed,
+        )
         self.spatial_hd = SpatialAttentionHead()
         self.obs_drop = ObservationalDropout(p=dropout_prob, mode="zero")
         self.world_hd = CausalTransformer()
-        self.controller = ControllerTrunk(action_dim=action_dim)
+        self.controller = ControllerTrunk(
+            action_dim=action_dim,
+            reward_head_kind=reward_head_kind,
+            reward_head_hidden_dim=reward_head_hidden_dim,
+        )
 
     # ------------------------------------------------------------------
     # Incremental inference

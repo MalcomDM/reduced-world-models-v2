@@ -15,6 +15,8 @@ from rwm.config.experiment_config import (
     ExperimentConfig,
     DataConfig,
     TemporalConfig,
+    PerceptionConfig,
+    ControllerConfig,
     TrainingConfig,
 )
 from rwm.loops.train_world_model import train_world_model_loop
@@ -74,6 +76,26 @@ def train_world_model(
         "train-rwm",
         help="Experiment name (used in default run directory path).",
     ),
+    cache_dir: Optional[Path] = typer.Option(
+        None, file_okay=False, dir_okay=True,
+        help="Path to frame cache (default: no cache). "
+             "Build with: python scripts/build_frame_cache.py",
+    ),
+    reward_head_kind: str = typer.Option(
+        "linear", help="Reward head architecture: 'linear' or 'nonlinear'",
+    ),
+    reward_head_hidden_dim: int = typer.Option(
+        32, help="Hidden dimension for nonlinear reward head",
+    ),
+    selection_mode: str = typer.Option(
+        "learned", help="Patch selection: learned | fixed_uniform | fixed_random",
+    ),
+    selection_k: int = typer.Option(
+        8, help="Number of selected patches",
+    ),
+    selection_seed: int = typer.Option(
+        0, help="RNG seed for fixed_random selection",
+    ),
 ):
     """Train a ReducedWorldModel on rollout data with held-out validation.
 
@@ -103,10 +125,20 @@ def train_world_model(
             dataset_dir=str(base_dir.resolve()),
             sequence_len=sequence_len,
             image_size=image_size,
+            cache_dir=str(cache_dir.resolve()) if cache_dir is not None else "",
         ),
         temporal=TemporalConfig(
             seq_len=sequence_len,
             warmup_steps=warmup_steps,
+        ),
+        perception=PerceptionConfig(
+            k=selection_k,
+            selection_mode=selection_mode,
+            selection_seed=selection_seed,
+        ),
+        controller=ControllerConfig(
+            reward_head_kind=reward_head_kind,
+            reward_head_hidden_dim=reward_head_hidden_dim,
         ),
         training=TrainingConfig(
             batch_size=batch_size,
@@ -153,6 +185,7 @@ def train_world_model(
         warmup_steps=warmup_steps,
         val_ratio=val_ratio,
         config=cfg,
+        cache_dir=cache_dir,
     )
 
     typer.echo(f"Training complete. Best model: {best_model_path}")

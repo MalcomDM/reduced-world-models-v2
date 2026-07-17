@@ -4,7 +4,7 @@
 
 This document is the engineering plan for moving the current repository from
 the legacy LSTM and behavior-memory controller toward the architecture defined
-in `technical_definitions.md`.
+in `../technical_definitions.md`.
 
 The post-Stage-2 theory/evidence audit and matched-ablation protocol are in
 `architecture_validation_plan.md`. That document is the source of truth for
@@ -110,7 +110,7 @@ The following are hard gates, not backlog suggestions:
 
 ### Completed Work
 
-- **Transition contract** (`docs/transition_contract.md`): documented exact
+- **Transition contract** (`docs/contracts/transition_contract.md`): documented exact
   semantics of every rollout array index, training-loop action shift, dataset
   window semantics, done-flag ambiguity, and broken LSTM call sites.
 - **Typed structures** (`src/rwm/types.py`): added `TemporalModelOutput`,
@@ -250,7 +250,7 @@ new reward-prediction result is treated as experimental evidence.
   the seed is applied before training begins.  Without ``--seed`` the
   command is fully backward compatible.
 
-- **Documentation** (`docs/experiment_artifacts.md`):
+- **Documentation** (`docs/protocols/experiment_artifacts.md`):
   Describes all artifact formats, code usage examples, and CLI integration.
 
 ### Design Decisions
@@ -280,7 +280,7 @@ new reward-prediction result is treated as experimental evidence.
 
 3. **Rollout metadata (terminated/truncated, policy ID, collector config).**
    The collector schema extension is deferred to Stage 7 per the approved
-   recommendations in ``docs/transition_contract.md``.
+   recommendations in ``docs/contracts/transition_contract.md``.
 
 4. **CLI integration for remaining commands.**
    ``train-controller``, ``test-rwm-manually``, and ``test-rwm-rollouts``
@@ -616,7 +616,7 @@ constant-mean comparison.
 ## Stage 2.5 — Validate the Architecture Hypotheses
 
 Detailed definitions, metrics, and gates are in
-`docs/architecture_validation_plan.md`.
+`docs/plans/architecture_validation_plan.md`.
 
 ### A — Measurement foundation
 
@@ -662,7 +662,7 @@ the original hard K-token value projection and pooling path. The training-only
 value projection expands from K=8 to N=225 tokens (28.1x for this small
 projection), so measured end-to-end throughput remains a later checkpoint;
 there is no all-token inference projection cost. See
-``docs/architecture_validation_plan.md`` for the exact equations.
+``docs/plans/architecture_validation_plan.md`` for the exact equations.
 
 | Test | Result |
 |------|--------|
@@ -734,10 +734,90 @@ anchor runs took roughly 9 minutes per seed, not 90 minutes.
 
 ### C — Perception ablations
 
-- Retrain learned/random/fixed/dense selection variants.
-- Compare `K=8/16/32`, deterministic/stochastic tokenization, corrected small
-  KL weights, and linear/nonlinear reward heads.
-- Measure task quality and mechanism statistics separately.
+**C.0 — Configurable reward-head architecture (COMPLETE).**
+The reward head in ``ControllerTrunk`` is now configurable:
+
+- ``"linear"`` (default, legacy compatible):
+  ``reward = Linear(concat(c_t, action_t))``
+- ``"nonlinear"``:
+  ``reward = Linear(concat(c_t, action_t), hidden) → ReLU → Linear(hidden, 1)``
+
+``ControllerConfig`` records ``reward_head_kind`` and ``reward_head_hidden_dim``.
+The default nonlinear experimental width is 32; it is ignored by the default
+linear head.
+Structured checkpoints store this metadata; loading a checkpoint without it
+defaults to ``"linear"``.  ``model_from_checkpoint()`` in ``checkpointing.py``
+builds the correct architecture from the checkpoint config.
+
+| Test | Result |
+|------|--------|
+| Linear forward shapes | PASSED |
+| Nonlinear forward shapes | PASSED |
+| Gradients flow to belief and action (nonlinear) | PASSED |
+| Legacy bare state_dict loads as linear | PASSED |
+| Structured nonlinear checkpoint round-trip | PASSED |
+| Config JSON round-trip | PASSED |
+| Full test suite | 183 passed |
+
+**Compatibility contract:** ``model_from_checkpoint()`` reads
+``config.controller.reward_head_kind`` from the checkpoint; if absent (legacy
+checkpoint or ``config=None``), defaults to ``"linear"``.  No silent guessing
+from state-dict keys.
+
+**C.1 — Reward-head capacity ablation (COMPLETE).**
+Two-seed comparison (42, 43) of linear vs nonlinear (83→32→1, ReLU) reward
+head at beta=0.1.  Results in ``runs/component_refinement/03_nonlinear_reward_head/``.
+
+| Seed | Head | Best val MSE | Ratio | vs baseline |
+|------|------|-------------|-------|-------------|
+| 42   | linear | 0.4663 | 0.828 | 17.2% below |
+| 42   | nonlinear | 0.4885 | 0.867 | 13.3% below |
+| 43   | linear | 0.4952 | 0.787 | 21.3% below |
+| 43   | nonlinear | 0.5054 | 0.803 | 19.7% below |
+
+**Verdict:** The nonlinear head does not consistently beat the linear baseline.
+Linear wins on seed 42; seed 43 is essentially tied.  The linear head remains
+the default for subsequent experiments.  Action probes: 4/4 unique for all 4
+checkpoints.
+
+**C.2A — Top-K selection ablation (COMPLETE).**
+Four runs (fixed_uniform × 2 seeds + fixed_random × 2 seeds) vs learned
+(Stage 02 anchors) at K=8, beta=0.1. The static controls used cached frames;
+the historical learned anchors did not, so this stage compares reward quality,
+not runtime.
+
+| Selection | Mean ratio | Seed 42 | Seed 43 |
+|-----------|-----------|---------|---------|
+| learned   | **0.808** | 0.828   | 0.787   |
+| fixed_uniform | 0.868 | 0.865 | 0.871 |
+| fixed_random  | 0.834 | 0.867 | 0.800 |
+
+**Verdict:** Learned adaptive Top-K consistently beats both static controls
+across both seeds.  The learned selector provides better held-out reward
+prediction than fixed patch-position candidates.  All 6 checkpoints pass
+the action probe (4/4).  See ``runs/component_refinement/RUN_INDEX.md`` for
+the full table.
+
+**C.2B — K-ablation (COMPLETE).**
+Six cached runs at K=4/16/32 × seeds 42/43 (beta=0.1, linear reward head,
+10 epochs) compared against the K=8 vectorized anchor.
+
+| K   | Seed | Ratio | Mean |
+|-----|------|-------|------|
+| 4   | 42   | 0.931 | 0.886 |
+| 4   | 43   | 0.841 |      |
+| 8   | 42   | 0.828 | 0.808 |
+| 8   | 43   | 0.787 |      |
+| 16  | 42   | 0.834 | 0.822 |
+| 16  | 43   | 0.809 |      |
+| 32  | 42   | 0.896 | 0.870 |
+| 32  | 43   | 0.843 |      |
+
+**Verdict:** K=8 and K=16 are essentially tied (mean ratio 0.808 vs 0.822).
+Both clearly outperform K=4 (0.886) and K=32 (0.870).  K=16 costs the same
+forward pass (CNN + tokenizer + scorer process all 225 patches regardless of
+K), so K=8 remains the default for computational efficiency.  See
+``runs/component_refinement/RUN_INDEX.md`` for full details.
 
 ### D — Masked dynamics gate
 

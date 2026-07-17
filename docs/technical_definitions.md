@@ -5,7 +5,7 @@
 This document consolidates the current architectural and training decisions for integrating an actor-critic controller into the Reduced World Models project.
 
 The implementation gaps, evidence limits, performance audit, and checkpointed
-validation protocol are maintained in `architecture_validation_plan.md`.
+validation protocol are maintained in `plans/architecture_validation_plan.md`.
 
 The research goal is:
 

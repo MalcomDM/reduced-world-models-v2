@@ -163,6 +163,79 @@ def load_checkpoint(
         }
 
 
+# ---------------------------------------------------------------------------
+# Model factory from checkpoint config
+# ---------------------------------------------------------------------------
+
+_VALID_REWARD_HEAD_KINDS = ("linear", "nonlinear")
+
+
+def model_from_checkpoint(
+    checkpoint: Dict[str, Any],
+    action_dim: int = 3,
+) -> "torch.nn.Module":
+    """Build a ``ReducedWorldModel`` from checkpoint metadata.
+
+    Reads reward-head and selection configuration from the checkpoint's
+    ``config``.  Legacy/missing fields default to ``"linear"`` head and
+    ``"learned"`` selection with ``k=8``.
+    """
+    from rwm.models.rwm.model import ReducedWorldModel
+
+    kind = "linear"
+    hidden = 32
+    sel_mode = "learned"
+    sel_k = 8
+    sel_seed = 0
+
+    cfg = checkpoint.get("config")
+    if cfg is not None:
+        # Controller config
+        ctrl_cfg = None
+        if hasattr(cfg, "controller"):
+            ctrl_cfg = cfg.controller
+        elif isinstance(cfg, dict) and "controller" in cfg:
+            from rwm.config.experiment_config import ControllerConfig
+            ctrl_cfg = ControllerConfig.from_dict(cfg["controller"])
+        if ctrl_cfg is not None:
+            kind = getattr(ctrl_cfg, "reward_head_kind", "linear")
+            hidden = getattr(ctrl_cfg, "reward_head_hidden_dim", 32)
+
+        # Perception / selection config
+        pc = None
+        if hasattr(cfg, "perception"):
+            pc = cfg.perception
+        elif isinstance(cfg, dict) and "perception" in cfg:
+            from rwm.config.experiment_config import PerceptionConfig
+            pc = PerceptionConfig.from_dict(cfg["perception"])
+        if pc is not None:
+            sel_mode = getattr(pc, "selection_mode", "learned")
+            sel_k = getattr(pc, "k", 8)
+            sel_seed = getattr(pc, "selection_seed", 0)
+
+    if kind not in _VALID_REWARD_HEAD_KINDS:
+        raise ValueError(
+            f"Invalid reward_head_kind in checkpoint metadata: {kind!r}. "
+            f"Must be one of {_VALID_REWARD_HEAD_KINDS}."
+        )
+    if not isinstance(hidden, int) or hidden < 1:
+        raise ValueError(
+            f"Invalid reward_head_hidden_dim in checkpoint metadata: {hidden}. "
+            "Must be a positive integer."
+        )
+
+    model = ReducedWorldModel(
+        action_dim=action_dim,
+        reward_head_kind=kind,
+        reward_head_hidden_dim=hidden,
+        selection_mode=sel_mode,
+        selection_k=sel_k,
+        selection_seed=sel_seed,
+    )
+    model.load_state_dict(checkpoint["model_state"])
+    return model
+
+
 def _postprocess_structured(raw: Dict[str, Any]) -> Dict[str, Any]:
     """Convert structured checkpoint raw dict to standardised output."""
     config_dict = raw.get("config")

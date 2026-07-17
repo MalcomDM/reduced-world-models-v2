@@ -34,6 +34,7 @@ def train_world_model_loop(
     warmup_steps: int = 20,
     val_ratio: float = 0.2,
     config: Optional[ExperimentConfig] = None,
+    cache_dir: Optional[Path] = None,
 ) -> Path:
     """
     Builds train/validation datasets using episode-safe file-level split,
@@ -59,9 +60,11 @@ def train_world_model_loop(
     from rwm.data.rollout_dataset import RolloutDataset
     train_ds = RolloutDataset.from_file_list(
         train_files, sequence_len=sequence_len, image_size=image_size,
+        cache_dir=cache_dir,
     )
     val_ds = RolloutDataset.from_file_list(
         val_files, sequence_len=sequence_len, image_size=image_size,
+        cache_dir=cache_dir,
     )
 
     nw = config.data.num_workers if config is not None else NUM_WORKERS

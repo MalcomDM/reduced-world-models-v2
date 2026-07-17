@@ -26,6 +26,7 @@ from rwm.data.rollout_dataset import RolloutDataset, _collect_npz_files
 from rwm.trainers.deterministic.world_model_trainer import WorldModelTrainer
 from rwm.config.experiment_config import ExperimentConfig, DataConfig, TrainingConfig
 from rwm.utils.seeding import set_seed
+from typing import Optional
 from torch.utils.data import DataLoader
 
 DATA_ROOT = Path("data/rollouts/rwm_deterministic/scenario_0")
@@ -41,6 +42,7 @@ def profile_epoch(
     val_ratio: float = 0.2,
     max_val_windows: int = 256,
     out_dir: Path = Path("/tmp/loader_profile"),
+    cache_dir: Optional[Path] = None,
 ) -> dict:
     set_seed(seed)
 
@@ -52,7 +54,7 @@ def profile_epoch(
     train_files = all_files[n_val:]
     val_files = all_files[:n_val]
 
-    cache_dir = Path("data/cache/rollout_frames_v1") if Path("data/cache/rollout_frames_v1").exists() else None
+    # cache_dir is passed explicitly from args; never auto-detect.
     train_ds = RolloutDataset.from_file_list(
         train_files, sequence_len=sequence_len, cache_dir=cache_dir,
     )
@@ -205,8 +207,14 @@ def main():
     parser.add_argument("--persistent-workers", action="store_true")
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--sequence-len", type=int, default=16)
+    parser.add_argument("--cache-dir", type=Path, default=None,
+                        help="Path to frame cache. Default: no cache.")
+    parser.add_argument("--no-cache", action="store_true",
+                        help="Explicitly disable cache (overrides --cache-dir).")
     parser.add_argument("--out", type=Path, default=Path("runs/component_refinement/benchmarks/loader_profile.json"))
     args = parser.parse_args()
+
+    cache_dir = None if args.no_cache else args.cache_dir
 
     results = profile_epoch(
         num_workers=args.num_workers,
@@ -214,6 +222,7 @@ def main():
         persistent_workers=args.persistent_workers,
         batch_size=args.batch_size,
         sequence_len=args.sequence_len,
+        cache_dir=cache_dir,
     )
     args.out.parent.mkdir(parents=True, exist_ok=True)
     with open(args.out, "w") as f:

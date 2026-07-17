@@ -128,7 +128,7 @@ class RolloutSample(TypedDict):
     training so the first belief is conditioned on the correct previous
     action rather than always zeros.
 
-    Reference: `docs/transition_contract.md`
+    Reference: `docs/contracts/transition_contract.md`
     """
     obs: Tensor         # shape (T, C, H, W)
     action: Tensor      # shape (T, A)   where A = 3 (steer, gas, brake)

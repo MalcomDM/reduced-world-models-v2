@@ -97,6 +97,8 @@ class PerceptionConfig:
     k: int = 8
     query_dim: int = 16
     values_dim: int = 32
+    selection_mode: str = "learned"
+    selection_seed: int = 0
 
     def to_dict(self) -> Dict[str, Any]:
         return _as_dict(self)
@@ -132,7 +134,7 @@ class TemporalConfig:
 
 @dataclasses.dataclass(frozen=True)
 class ControllerConfig:
-    """Controller (legacy action-regression path)."""
+    """Shared controller-trunk and head architecture configuration."""
     action_dim: int = 3
     hidden_dim: int = 80
     noise_std: float = 0.3
@@ -142,6 +144,8 @@ class ControllerConfig:
     positive_threshold: float = 0.0
     memory_batch: int = 20
     memory_size: int = 1000
+    reward_head_kind: str = "linear"
+    reward_head_hidden_dim: int = 32
 
     def to_dict(self) -> Dict[str, Any]:
         return _as_dict(self)

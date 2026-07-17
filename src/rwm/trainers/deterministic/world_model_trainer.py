@@ -81,7 +81,30 @@ class WorldModelTrainer:
         self._last_train_reward_mean = 0.0
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.model = ReducedWorldModel(action_dim=ACTION_DIM).to(self.device)
+        # Read architecture config.
+        rh_kind = "linear"
+        rh_hidden = 32
+        sel_mode = "learned"
+        sel_k = 8
+        sel_seed = 0
+        if config is not None:
+            if hasattr(config, "controller"):
+                cc = config.controller
+                rh_kind = getattr(cc, "reward_head_kind", "linear")
+                rh_hidden = getattr(cc, "reward_head_hidden_dim", 32)
+            if hasattr(config, "perception"):
+                pc = config.perception
+                sel_mode = getattr(pc, "selection_mode", "learned")
+                sel_k = getattr(pc, "k", 8)
+                sel_seed = getattr(pc, "selection_seed", 0)
+        self.model = ReducedWorldModel(
+            action_dim=ACTION_DIM,
+            reward_head_kind=rh_kind,
+            reward_head_hidden_dim=rh_hidden,
+            selection_mode=sel_mode,
+            selection_k=sel_k,
+            selection_seed=sel_seed,
+        ).to(self.device)
         self.optimizer = optim.Adam(self.model.parameters(), lr=self.lr)
 
         self.out_dir = out_dir

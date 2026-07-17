@@ -37,7 +37,7 @@ from rwm.data.rollout_dataset import (
     _collect_npz_files,
 )
 from rwm.trainers.deterministic.world_model_trainer import WorldModelTrainer
-from rwm.config.experiment_config import ExperimentConfig, DataConfig, TrainingConfig
+from rwm.config.experiment_config import ExperimentConfig, DataConfig, PerceptionConfig, ControllerConfig, TrainingConfig
 from rwm.utils.run_directory import create_run_directory
 from rwm.utils.dataset_manifest import build_dataset_manifest, save_manifest
 from rwm.utils.seeding import set_seed
@@ -68,9 +68,9 @@ def _collect_and_split(
     return train_files, val_files
 
 
-def _bounded_val_loader(val_files, sequence_len, batch_size, max_val_windows, seed):
+def _bounded_val_loader(val_files, sequence_len, batch_size, max_val_windows, seed, cache_dir=None):
     """Create a DataLoader limited to max_val_windows windows."""
-    ds = RolloutDataset.from_file_list(val_files, sequence_len=sequence_len)
+    ds = RolloutDataset.from_file_list(val_files, sequence_len=sequence_len, cache_dir=cache_dir)
     n = min(max_val_windows, len(ds))
     rng = np.random.RandomState(seed)
     indices = rng.choice(len(ds), size=n, replace=False).tolist()
@@ -95,6 +95,12 @@ def run(
     max_train_files: Optional[int] = None,
     max_val_windows: Optional[int] = None,
     profile: bool = False,
+    cache_dir: Optional[Path] = None,
+    reward_head_kind: str = "linear",
+    reward_head_hidden_dim: int = 32,
+    selection_mode: str = "learned",
+    selection_k: int = 8,
+    selection_seed: int = 0,
 ) -> Dict:
     set_seed(seed)
 
@@ -105,6 +111,16 @@ def run(
         data=DataConfig(
             dataset_dir=str(DATA_ROOT.resolve()),
             sequence_len=sequence_len,
+            cache_dir=str(cache_dir.resolve()) if cache_dir is not None else "",
+        ),
+        perception=PerceptionConfig(
+            k=selection_k,
+            selection_mode=selection_mode,
+            selection_seed=selection_seed,
+        ),
+        controller=ControllerConfig(
+            reward_head_kind=reward_head_kind,
+            reward_head_hidden_dim=reward_head_hidden_dim,
         ),
         training=TrainingConfig(
             batch_size=batch_size,
@@ -132,7 +148,7 @@ def run(
     )
 
     train_ds = RolloutDataset.from_file_list(
-        train_files, sequence_len=sequence_len,
+        train_files, sequence_len=sequence_len, cache_dir=cache_dir,
     )
     nw = cfg.data.num_workers
     train_loader = DataLoader(
@@ -147,9 +163,12 @@ def run(
         if max_val_windows is not None:
             val_loader, actual_val_windows = _bounded_val_loader(
                 val_files, sequence_len, batch_size, max_val_windows, seed,
+                cache_dir=cache_dir,
             )
         else:
-            ds = RolloutDataset.from_file_list(val_files, sequence_len=sequence_len)
+            ds = RolloutDataset.from_file_list(
+                val_files, sequence_len=sequence_len, cache_dir=cache_dir,
+            )
             actual_val_windows = len(ds)
             val_loader = DataLoader(
                 ds, batch_size=batch_size, shuffle=False,
@@ -262,15 +281,16 @@ def action_probe(checkpoint_path: Optional[Path] = None, seed: int = 42):
     """Action sensitivity probe on a trained or fresh model."""
     set_seed(seed)
     from rwm.models.rwm.model import ReducedWorldModel
+    from rwm.utils.checkpointing import model_from_checkpoint
 
     print("Loading model...")
-    model = ReducedWorldModel()
     if checkpoint_path and checkpoint_path.exists():
         ckpt = load_checkpoint(checkpoint_path)
-        model.load_state_dict(ckpt["model_state"])
+        model = model_from_checkpoint(ckpt, action_dim=3)
         print(f"Loaded trained checkpoint: {checkpoint_path}")
     else:
         print("Using FRESH (untrained) model")
+        model = ReducedWorldModel(action_dim=3)
     model.eval()
 
     img = torch.randn(1, 3, 64, 64)
@@ -320,6 +340,18 @@ def main():
     parser.add_argument("--max-train-files", type=int, default=None)
     parser.add_argument("--max-val-windows", type=int, default=128)
     parser.add_argument("--profile", action="store_true")
+    parser.add_argument("--cache-dir", type=Path, default=None,
+                        help="Path to frame cache (default: no cache)")
+    parser.add_argument("--reward-head-kind", type=str, default="linear",
+                        help="Reward head architecture: linear or nonlinear")
+    parser.add_argument("--reward-head-hidden-dim", type=int, default=32,
+                        help="Hidden dimension for nonlinear reward head")
+    parser.add_argument("--selection-mode", type=str, default="learned",
+                        help="Patch selection: learned | fixed_uniform | fixed_random")
+    parser.add_argument("--selection-k", type=int, default=8,
+                        help="Number of selected patches")
+    parser.add_argument("--selection-seed", type=int, default=0,
+                        help="RNG seed for fixed_random selection")
     parser.add_argument("--checkpoint", type=Path, default=None,
                         help="Path to checkpoint for action probe")
     args = parser.parse_args()
@@ -352,6 +384,12 @@ def main():
             max_train_files=args.max_train_files,
             max_val_windows=args.max_val_windows,
             profile=args.profile,
+            cache_dir=args.cache_dir,
+            reward_head_kind=args.reward_head_kind,
+            reward_head_hidden_dim=args.reward_head_hidden_dim,
+            selection_mode=args.selection_mode,
+            selection_k=args.selection_k,
+            selection_seed=args.selection_seed,
         )
     except FileExistsError as error:
         parser.error(

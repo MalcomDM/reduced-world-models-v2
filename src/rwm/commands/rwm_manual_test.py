@@ -26,10 +26,11 @@ def preprocess_obs(obs: np.ndarray, device: torch.device) -> torch.Tensor:
 
 
 def load_model(checkpoint_path: Path, device: torch.device) -> ReducedWorldModel:
-    """Load a structured Stage-2 checkpoint into the active architecture."""
-    checkpoint = load_checkpoint(checkpoint_path, map_location=str(device))
-    model = ReducedWorldModel(action_dim=ACTION_DIM)
-    model.load_state_dict(checkpoint["model_state"])
+    """Load a structured Stage-2 checkpoint, respecting the saved
+    reward-head architecture (linear or nonlinear)."""
+    from rwm.utils.checkpointing import load_checkpoint, model_from_checkpoint
+    ckpt = load_checkpoint(checkpoint_path, map_location=str(device))
+    model = model_from_checkpoint(ckpt, action_dim=ACTION_DIM)
     return model.to(device).eval()
 
 

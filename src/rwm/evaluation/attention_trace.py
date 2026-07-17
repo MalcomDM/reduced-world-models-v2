@@ -75,18 +75,27 @@ class AttentionTrace:
         ``(N, 2)`` — (y, x) patch centres in feature-map coordinates.
     image_coords:
         ``(N, 2)`` — (y, x) patch centres in image pixel coordinates.
+    selection_mode:
+        Active selection mode (``"learned"``, ``"fixed_uniform"``, or
+        ``"fixed_random"``).
+    selection_k:
+        Number of selected tokens (``K``).
     """
     def __init__(
         self,
         logits: torch.Tensor,
         indices: torch.Tensor,
         weights: torch.Tensor,
+        selection_mode: str = "learned",
+        selection_k: int = 8,
     ):
         self.logits = logits.detach().cpu()
         self.indices = indices.detach().cpu()
         self.weights = weights.detach().cpu()
         self.grid_coords = patch_grid_coords()
         self.image_coords = image_coords_from_patches()
+        self.selection_mode = selection_mode
+        self.selection_k = selection_k
 
 
 def trace_attention(model, img: torch.Tensor) -> AttentionTrace:
@@ -112,7 +121,12 @@ def trace_attention(model, img: torch.Tensor) -> AttentionTrace:
         _h_spatial, attn_k = model.spatial_hd(tokens, logits, selection_mask, indices)
 
     model.train(was_training)
-    return AttentionTrace(logits=logits, indices=indices, weights=attn_k)
+    sel_mode = getattr(model.selector, "selection_mode", "learned")
+    sel_k = getattr(model.selector, "k", 8)
+    return AttentionTrace(
+        logits=logits, indices=indices, weights=attn_k,
+        selection_mode=sel_mode, selection_k=sel_k,
+    )
 
 
 # ---------------------------------------------------------------------------

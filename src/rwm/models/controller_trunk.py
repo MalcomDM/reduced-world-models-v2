@@ -1,4 +1,4 @@
-"""Shared controller trunk with reward head.
+"""Shared controller trunk with configurable reward head.
 
 Timing contract (approved):
 
@@ -9,10 +9,19 @@ Timing contract (approved):
     ControllerTrunk.predict_reward(shared_repr, action[t])
                                   → reward[t] (= r_{t+1})
 
-The shared representation is ``actor-ready``: it depends only on the past
-(observations up to ``t`` and actions up to ``t-1``), so the Actor can
-choose ``action[t]`` without circular dependence.  The reward head
-receives the current action separately.
+Reward head architecture is configurable:
+
+    "linear" (default):
+        reward = Linear(concat(c_t, action_t)) -> scalar
+
+    "nonlinear":
+        reward = Linear(concat(c_t, action_t), hidden)
+                 -> ReLU
+                 -> Linear(hidden, 1)
+
+The shared representation ``c_t = encode(belief)`` is actor-ready: it depends
+only on the past, so the Actor can choose action[t] without circular
+dependence.  The reward head receives the current action separately.
 """
 
 from typing import Optional, Tuple
@@ -22,6 +31,8 @@ import torch.nn as nn
 
 from rwm.config.config import ACTION_DIM, WORLD_STATE_DIM
 
+_REWARD_HEAD_KINDS = ("linear", "nonlinear")
+
 
 class ControllerTrunk(nn.Module):
     """Shared interpretation layer for the causal temporal state.
@@ -29,11 +40,16 @@ class ControllerTrunk(nn.Module):
     Parameters
     ----------
     input_dim:
-        Dimension of the incoming world state (default: ``WORLD_STATE_DIM``).
+        Dimension of the incoming world state.
     hidden_dim:
         Hidden dimension of the shared trunk (default: ``input_dim``).
     action_dim:
         Dimension of the action vector for reward conditioning.
+    reward_head_kind:
+        ``"linear"`` (default) or ``"nonlinear"``.
+    reward_head_hidden_dim:
+        Hidden dimension for the nonlinear head (ignored for linear).
+        Default: 32.
     """
 
     def __init__(
@@ -41,8 +57,23 @@ class ControllerTrunk(nn.Module):
         input_dim: int = WORLD_STATE_DIM,
         hidden_dim: Optional[int] = None,
         action_dim: int = ACTION_DIM,
+        reward_head_kind: str = "linear",
+        reward_head_hidden_dim: int = 32,
     ):
-        super().__init__() # type: ignore
+        super().__init__()
+
+        if reward_head_kind not in _REWARD_HEAD_KINDS:
+            raise ValueError(
+                f"reward_head_kind must be one of {_REWARD_HEAD_KINDS}, "
+                f"got {reward_head_kind!r}"
+            )
+        if not isinstance(reward_head_hidden_dim, int) or reward_head_hidden_dim < 1:
+            raise ValueError(
+                "reward_head_hidden_dim must be a positive integer, "
+                f"got {reward_head_hidden_dim!r}"
+            )
+        self._reward_head_kind = reward_head_kind
+
         if hidden_dim is None:
             hidden_dim = input_dim
 
@@ -50,29 +81,23 @@ class ControllerTrunk(nn.Module):
             nn.Linear(input_dim, hidden_dim),
             nn.ReLU(),
         )
-        # Reward head conditioned on shared_repr + current_action.
-        self.reward_head = nn.Linear(hidden_dim + action_dim, 1)
+
+        joint_dim = hidden_dim + action_dim
+        if reward_head_kind == "linear":
+            self.reward_head = nn.Linear(joint_dim, 1)
+        else:
+            self.reward_head = nn.Sequential(
+                nn.Linear(joint_dim, reward_head_hidden_dim),
+                nn.ReLU(),
+                nn.Linear(reward_head_hidden_dim, 1),
+            )
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
     def encode(self, belief: torch.Tensor) -> torch.Tensor:
-        """Compute the actor-ready shared representation from a belief.
-
-        Parameters
-        ----------
-        belief:
-            ``(B, D)`` — latent temporal state from the CausalTransformer
-            (depends only on the past).
-
-        Returns
-        -------
-        shared_repr:
-            ``(B, hidden_dim)`` — shared representation that the Actor and
-            Critic will consume (Stage 4).  Pre-action: depends only on
-            obs up to ``t`` and actions up to ``t-1``.
-        """
+        """Actor-ready shared representation from a belief."""
         return self.shared(belief)
 
     def predict_reward(
@@ -81,21 +106,7 @@ class ControllerTrunk(nn.Module):
         action: torch.Tensor,
     ) -> torch.Tensor:
         """Predict immediate reward from shared representation and the
-        *current* action.
-
-        Parameters
-        ----------
-        shared_repr:
-            ``(B, hidden_dim)`` — from ``encode()``.
-        action:
-            ``(B, action_dim)`` — the action taken *after* the belief was
-            computed (``action[t]``).
-
-        Returns
-        -------
-        reward_pred:
-            ``(B, 1)`` — predicted immediate reward ``r_{t+1}``.
-        """
+        *current* action."""
         x = torch.cat([shared_repr, action], dim=-1)
         return self.reward_head(x)
 
@@ -104,22 +115,7 @@ class ControllerTrunk(nn.Module):
         belief: torch.Tensor,
         action: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Convenience forward: encode + predict_reward in one call.
-
-        Parameters
-        ----------
-        belief:
-            ``(B, D)`` — latent temporal state.
-        action:
-            ``(B, action_dim)`` — current action.
-
-        Returns
-        -------
-        shared_repr:
-            ``(B, hidden_dim)`` — actor-ready shared representation.
-        reward_pred:
-            ``(B, 1)`` — predicted immediate reward.
-        """
+        """Convenience: encode + predict_reward in one call."""
         h = self.encode(belief)
         r = self.predict_reward(h, action)
         return h, r

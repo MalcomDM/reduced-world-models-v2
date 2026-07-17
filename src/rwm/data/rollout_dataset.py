@@ -12,6 +12,9 @@ from rwm.types import RolloutSample
 from rwm.data.cache_utils import (
     load_manifest as _load_cache_manifest,
     verify_cache_entry as _verify_cache_entry,
+    _CACHE_SCHEMA_VERSION,
+    _TRANSFORM_SPEC,
+    _DEFAULT_IMAGE_SIZE,
 )
 
 
@@ -154,8 +157,8 @@ class RolloutDataset(Dataset[RolloutSample]):
 		self._cache_manifest: Optional[Dict] = None
 		self._cached_episodes: Dict[str, "np.ndarray"] = {}
 
-		# Validate cache at init time
-		if cache_dir is not None:
+		# Cache validation at init time
+		if cache_dir is not None and str(cache_dir).strip():
 			cd = Path(cache_dir)
 			if not cd.exists():
 				raise ValueError(
@@ -163,7 +166,17 @@ class RolloutDataset(Dataset[RolloutSample]):
 					"Build the cache first:\n"
 					f"  python scripts/build_frame_cache.py --cache-dir {cd}"
 				)
-			self._cache_manifest = _load_cache_manifest(cd)
+			# Validate manifest against requested image_size and default transform spec
+			self._cache_manifest = _load_cache_manifest(
+				cd, image_size=image_size, transform_spec=_TRANSFORM_SPEC,
+			)
+			if transform is not None:
+				raise ValueError(
+					"A custom Dataset transform cannot be used with a frame cache. "
+					"The cache was built for the default transform "
+					f"({_TRANSFORM_SPEC}, image_size={image_size}). "
+					"Either omit the custom transform, or set cache_dir to None/empty."
+				)
 			self._cache_dir = cd
 		else:
 			self._cache_dir = None
@@ -240,16 +253,10 @@ class RolloutDataset(Dataset[RolloutSample]):
 		if self._cache_dir is not None:
 			fs = str(file_path.resolve())
 			if fs not in self._cached_episodes:
-				data_root = None
-				if self._cache_manifest:
-					dr = self._cache_manifest.get("data_root")
-					if dr:
-						data_root = Path(dr)
 				cache_path = _verify_cache_entry(
 					self._cache_dir, file_path,
-					self._cache_manifest.get("file_map", {}) if self._cache_manifest else {},
+					self._cache_manifest or {},
 					self._image_size,
-					data_root=data_root,
 				)
 				cached = np.load(cache_path, mmap_mode="r")
 				self._cached_episodes[fs] = cached

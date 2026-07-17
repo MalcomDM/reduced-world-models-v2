@@ -6,18 +6,19 @@
 |---|---|---|
 | Thesis direction and terminology | `Summary.md` | Concise research motivation; not an execution checklist. |
 | Architecture, timing, objectives, and gradient boundaries | `technical_definitions.md` | Canonical design contract. |
-| Rollout indexing and schema semantics | `transition_contract.md` | Canonical data contract; preserves historical bugs as labelled evidence. |
-| Research hypotheses, evidence limits, performance audit, and ablations | `architecture_validation_plan.md` | Canonical Stage 2.5 validation plan. |
-| Implementation order and completion history | `implementation_plan.md` | Canonical engineering stage plan. |
-| Results of completed experiments | `evidences/` | Immutable-style evidence reports, annotated when later audits narrow their interpretation. |
-| Run/config/checkpoint conventions | `experiment_artifacts.md` | Reproducibility and artifact contract. |
+| Rollout indexing and schema semantics | `contracts/transition_contract.md` | Canonical data contract; preserves historical bugs as labelled evidence. |
+| Research hypotheses, evidence limits, performance audit, and ablations | `plans/architecture_validation_plan.md` | Canonical Stage 2.5 validation plan. |
+| Implementation order and completion history | `plans/implementation_plan.md` | Canonical engineering stage plan. |
+| Thesis-facing probe record | `evidence/theoretical_probes.md` | Concise claims, matched evidence, and limits. |
+| Detailed experiment evidence | `evidence/` | Reproducible experiment reports. |
+| Run/config/checkpoint conventions | `protocols/experiment_artifacts.md` | Reproducibility and artifact contract. |
 
 When two documents appear to conflict, prefer this order:
 
 1. `technical_definitions.md` for current architectural semantics;
-2. `transition_contract.md` for dataset/indexing semantics;
-3. `architecture_validation_plan.md` for whether a claim is experimentally established;
-4. `implementation_plan.md` for execution sequence.
+2. `contracts/transition_contract.md` for dataset/indexing semantics;
+3. `plans/architecture_validation_plan.md` for whether a claim is experimentally established;
+4. `plans/implementation_plan.md` for execution sequence.
 
 ## Stage Map
 
@@ -74,4 +75,4 @@ rwm eval status <eval-dir>
 | `src/rwm/evaluation/branch_runner.py` | Deterministic branch experiments |
 | `src/rwm/evaluation/episode_evaluator.py` | Full-episode evaluation (unique transitions) |
 | `src/rwm/evaluation/attention_trace.py` | Attention instrumentation and rendering |
-| `docs/evaluation_protocol.md` | Detailed collection/labeling/evaluation protocol |
+| `docs/protocols/evaluation_protocol.md` | Detailed collection/labeling/evaluation protocol |

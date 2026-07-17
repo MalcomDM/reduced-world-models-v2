@@ -1,8 +1,8 @@
 # Reduced World Models — Design Direction
 
 > Execution status, current evidence, and stage gates are maintained in
-> `README.md`, `architecture_validation_plan.md`, and
-> `implementation_plan.md`. This document is the concise design rationale.
+> `README.md`, `plans/architecture_validation_plan.md`, and
+> `plans/implementation_plan.md`. This document is the concise design rationale.
 
 ## Context
 

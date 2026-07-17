@@ -105,7 +105,7 @@ conclusion is narrow: the direct current-action reward branch contributes
 almost nothing on this sparse random-policy distribution. It does not test the
 importance of previous actions in temporal context or multi-step action effects
 under a competent policy. A controlled masked-horizon action-branch test is
-defined in `docs/architecture_validation_plan.md`.
+defined in `docs/plans/architecture_validation_plan.md`.
 
 ## Interactive human-driving diagnostic
 
@@ -194,5 +194,5 @@ being intentionally disabled.
 
 Proceed first through the fixed scientific suite, correctness repairs,
 perception ablations, and masked-dynamics gate in
-`docs/architecture_validation_plan.md`. Use `beta=0` only to reproduce the
+`docs/plans/architecture_validation_plan.md`. Use `beta=0` only to reproduce the
 historical anchor; nonzero-beta conclusions require the KL fix.

@@ -94,7 +94,7 @@ class TestConfig:
             experiment_name="test_exp",
             run_id="test_001",
             seed=99,
-            data=DataConfig(sequence_len=10, image_size=32),
+            data=DataConfig(sequence_len=10, image_size=32, cache_dir="data/cache/test"),
             training=TrainingConfig(batch_size=16, max_epochs=5),
         )
         path = tmp_path / "cfg.json"
@@ -106,6 +106,7 @@ class TestConfig:
         assert loaded.seed == 99
         assert loaded.data.sequence_len == 10
         assert loaded.data.image_size == 32
+        assert loaded.data.cache_dir == "data/cache/test"
         assert loaded.training.batch_size == 16
         assert loaded.training.max_epochs == 5
 

@@ -1,6 +1,7 @@
 import pytest
 import numpy as np
 from pathlib import Path
+import importlib.util
 
 from rwm.data.rollout_dataset import (
     RolloutDataset,
@@ -100,6 +101,16 @@ def test_build_train_val_datasets_respects_episodes(tmp_path: Path):
 
 import torch
 
+
+def _build_frame_cache(data_root: Path, cache_dir: Path, **kwargs):
+    """Load the standalone cache-builder script without assuming scripts is a package."""
+    script_path = Path(__file__).parents[2] / "scripts" / "build_frame_cache.py"
+    spec = importlib.util.spec_from_file_location("build_frame_cache_test", script_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.build_cache(data_root=data_root, cache_dir=cache_dir, **kwargs)
+
 # ---------------------------------------------------------------------------
 # Frame-cache tests
 # ---------------------------------------------------------------------------
@@ -107,7 +118,6 @@ import torch
 @pytest.mark.dataset
 def test_cache_parity(tmp_path: Path):
     """Cached and uncached dataset samples must match exactly."""
-    from scripts.build_frame_cache import build_cache
     src = tmp_path / "data"
     src.mkdir()
     rng = np.random.RandomState(0)
@@ -118,7 +128,7 @@ def test_cache_parity(tmp_path: Path):
     np.savez_compressed(src / "ep.npz", obs=obs, action=act, reward=rew, done=don)
 
     cache_dir = tmp_path / "cache"
-    build_cache(data_root=src, cache_dir=cache_dir, dry_run=False)
+    _build_frame_cache(data_root=src, cache_dir=cache_dir, dry_run=False)
 
     ds_u = RolloutDataset.from_file_list([src / "ep.npz"], sequence_len=8)
     ds_c = RolloutDataset.from_file_list([src / "ep.npz"], sequence_len=8, cache_dir=cache_dir)
@@ -134,10 +144,15 @@ def test_cache_missing_entry_fails(tmp_path: Path):
     """Accessing a source not in the cache manifest must raise."""
     cache_dir = tmp_path / "cache"
     cache_dir.mkdir()
-    # Write an empty manifest
+    # Write a manifest with data_root but no matching entry
     import json
     with open(cache_dir / "manifest.json", "w") as f:
-        json.dump({"schema_version": 1, "image_size": 64, "transform_spec": "ToTensor+Resize", "file_map": {}}, f)
+        json.dump({
+            "schema_version": 1, "image_size": 64,
+            "transform_spec": "ToTensor+Resize",
+            "data_root": str(tmp_path.resolve()),
+            "file_map": {},
+        }, f)
     src = tmp_path / "unknown.npz"
     np.savez_compressed(src, obs=np.zeros((20, 64, 64, 3), dtype=np.uint8),
                         action=np.zeros((20, 3)), reward=np.zeros(20), done=np.zeros(20, dtype=bool))
@@ -148,7 +163,6 @@ def test_cache_missing_entry_fails(tmp_path: Path):
 @pytest.mark.dataset
 def test_cache_source_modification_invalidates(tmp_path: Path):
     """Changing the source file after caching must produce a key mismatch error."""
-    from scripts.build_frame_cache import build_cache
     src = tmp_path / "data"
     src.mkdir()
     rng = np.random.RandomState(0)
@@ -158,7 +172,7 @@ def test_cache_source_modification_invalidates(tmp_path: Path):
         reward=np.zeros(20, dtype=np.float32),
         done=np.zeros(20, dtype=bool))
     cache_dir = tmp_path / "cache"
-    build_cache(data_root=src, cache_dir=cache_dir, dry_run=False)
+    _build_frame_cache(data_root=src, cache_dir=cache_dir, dry_run=False)
 
     # Modify source
     rng2 = np.random.RandomState(99)
@@ -172,29 +186,38 @@ def test_cache_source_modification_invalidates(tmp_path: Path):
         _ = ds[0]
 
 @pytest.mark.dataset
-def test_cache_transform_mismatch_fails(tmp_path: Path):
-    """A cache built for image_size=64 must reject a request for image_size=32."""
-    from scripts.build_frame_cache import build_cache
+def test_cache_image_size_mismatch_fails_at_init(tmp_path: Path):
+    """Requesting image_size=32 with a 64-pixel cache must fail at Dataset init."""
     src = tmp_path / "data"
     src.mkdir()
     np.savez_compressed(src / "ep.npz",
         obs=np.zeros((20, 64, 64, 3), dtype=np.uint8),
         action=np.zeros((20, 3)), reward=np.zeros(20), done=np.zeros(20, dtype=bool))
     cache_dir = tmp_path / "cache"
-    build_cache(data_root=src, cache_dir=cache_dir, image_size=64)
-    # Re-initialize with a different image_size — the cached results are at 64
-    # and the dataset will find the cache but key mismatch on size.
-    # The cache_utils manifest check will reject image_size mismatch at init time.
-    from rwm.data.cache_utils import load_manifest, verify_cache_entry
-    # Dataset init succeeds (the manifest passes schema check),
-    # but accessing a sample triggers verify_cache_entry which checks shapes.
-    ds = RolloutDataset.from_file_list([src / "ep.npz"], sequence_len=8, cache_dir=cache_dir)
-    # The dataset uses image_size from the cache manifest, not from the constructor.
-    # verify_cache_entry will pass because the cache actually has 64-wide frames.
-    # But the dataset's _image_size is 64 (from cache manifest), not 32.
-    # So this test should verify that the cached frames are 64-wide, not 32.
-    sample = ds[0]
-    assert sample["obs"].shape[2] == 64, f"Expected 64-wide obs from 64-px cache, got {sample['obs'].shape}"
+    _build_frame_cache(data_root=src, cache_dir=cache_dir, image_size=64)
+    # The dataset constructor calls load_manifest which validates image_size.
+    with pytest.raises(ValueError, match="image size"):
+        RolloutDataset.from_file_list(
+            [src / "ep.npz"], sequence_len=8, image_size=32, cache_dir=cache_dir,
+        )
+
+@pytest.mark.dataset
+def test_custom_transform_with_cache_fails(tmp_path: Path):
+    """A custom Dataset transform must be rejected when cache_dir is provided."""
+    src = tmp_path / "data"
+    src.mkdir()
+    np.savez_compressed(src / "ep.npz",
+        obs=np.zeros((20, 64, 64, 3), dtype=np.uint8),
+        action=np.zeros((20, 3)), reward=np.zeros(20), done=np.zeros(20, dtype=bool))
+    cache_dir = tmp_path / "cache"
+    _build_frame_cache(data_root=src, cache_dir=cache_dir)
+    from torchvision import transforms as T
+    custom = T.Compose([T.ToTensor(), T.Resize((64, 64), antialias=True)])
+    with pytest.raises(ValueError, match="custom.*transform"):
+        RolloutDataset(
+            file_list=[src / "ep.npz"], sequence_len=8,
+            cache_dir=cache_dir, transform=custom,
+        )
 
 
 # ---------------------------------------------------------------------------
