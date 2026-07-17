@@ -14,6 +14,13 @@
 
 	"python.analysis.stubPath": "./typings",
 	"python-envs.defaultEnvManager": "ms-python.python:conda",
-	"python-envs.defaultPackageManager": "ms-python.python:conda"
+	"python-envs.defaultPackageManager": "ms-python.python:conda",
+	"notebook.output.fontSize": 10,
+	"notebook.markup.fontSize": 12,
+	"notebook.cellToolbarLocation": {
+		"default": "hidden"
+	},
+	"notebook.compactView": true,
+	"jupyter.notebookFileRoot": "${workspaceFolder}"
 
 }

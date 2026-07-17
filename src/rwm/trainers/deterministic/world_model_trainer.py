@@ -28,8 +28,30 @@ from rwm.utils.checkpointing import save_checkpoint
 
 
 def kl_normal(mu: Tensor, logvar: Tensor) -> Tensor:
-    kl = 0.5 * (logvar.exp() + mu.pow(2) - 1.0 - logvar)
-    return kl.mean(dim=-1).mean(dim=-1).mean()
+    """KL( N(mu, sigma^2) || N(0, I) ) per posterior element.
+
+    The KL expression is applied **elementwise** before any reduction:
+
+        kl_per_element = 0.5 * (mu^2 + exp(logvar) - 1 - logvar)
+
+    The result is then averaged over all dimensions (batch, time, patches,
+    channels).  This is mathematically required: averaging mu or logvar
+    before the nonlinear KL expression would give a different (incorrect)
+    value.
+
+    Parameters
+    ----------
+    mu:
+        Post-sampling tokenizer mean (``(B, ..., D)``).
+    logvar:
+        Post-sampling tokenizer log-variance (``(B, ..., D)``).
+
+    Returns
+    -------
+    Scalar tensor — mean KL over all posterior elements.
+    """
+    kl = 0.5 * (mu.pow(2) + logvar.exp() - 1.0 - logvar)
+    return kl.mean()
 
 
 class WorldModelTrainer:
@@ -144,7 +166,7 @@ class WorldModelTrainer:
     ) -> Tuple[Tensor, Tensor, Tensor]:
         """Full-sequence loss, returns (total_loss, reward_mse, kl_loss).
 
-        prev_actions[:, 0] = zeros
+        prev_actions[:, 0] = predecessor_action
         prev_actions[:, t] = actions[:, t-1]
         Transformer(obs[:, t], prev_actions[:, t], history) → belief_t
         ControllerTrunk(belief_t, current_actions[:, t])    → reward_pred[t]
@@ -157,7 +179,17 @@ class WorldModelTrainer:
         B, T = rew.shape
         assert self.sequence_len <= T
 
+        # Previous actions: first position uses the predecessor action
+        # (zeros at true episode start, action[offset-1] mid-episode).
+        if "predecessor_action" not in batch:
+            raise KeyError(
+                "Batch is missing required predecessor_action. RolloutDataset must "
+                "supply action[offset - 1] (or zeros only at a true episode start)."
+            )
         prev_actions = torch.zeros(B, self.sequence_len, ACTION_DIM, device=self.device)
+        prev_actions[:, 0] = batch["predecessor_action"].to(
+            self.device, non_blocking=True,
+        )
         if self.sequence_len > 1:
             prev_actions[:, 1:] = act[:, :self.sequence_len - 1]
         current_actions = act[:, :self.sequence_len]
@@ -196,7 +228,13 @@ class WorldModelTrainer:
                 B, T = rew.shape
                 seq_len = min(self.sequence_len, T)
 
+                if "predecessor_action" not in batch:
+                    raise KeyError(
+                        "Batch is missing required predecessor_action. RolloutDataset must "
+                        "supply action[offset - 1] (or zeros only at a true episode start)."
+                    )
                 prev_actions = torch.zeros(B, seq_len, ACTION_DIM, device=self.device)
+                prev_actions[:, 0] = batch["predecessor_action"].to(self.device)
                 if seq_len > 1:
                     prev_actions[:, 1:] = act[:, :seq_len - 1]
                 current_actions = act[:, :seq_len]

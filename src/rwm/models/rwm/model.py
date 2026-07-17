@@ -54,10 +54,10 @@ def _perceive_frame(
     if isinstance(tok_out, tuple) and len(tok_out) >= 3:
         _, tok_mu, tok_logvar = tok_out
     logits = scorer(tokens)
-    mask_soft, indices = selector(logits)
-    h_spatial, _attn_k = spatial_hd(tokens, logits, indices)
+    selection_mask, indices = selector(logits)
+    h_spatial, _attn_k = spatial_hd(tokens, logits, selection_mask, indices)
     h_spatial = obs_drop(h_spatial, force_keep=force_keep)
-    return h_spatial, mask_soft, indices, tok_mu, tok_logvar
+    return h_spatial, selection_mask, indices, tok_mu, tok_logvar
 
 
 class ReducedWorldModel(nn.Module):
@@ -157,80 +157,72 @@ class ReducedWorldModel(nn.Module):
         current_actions: torch.Tensor,  # (B, T, A) action[t] for reward head at each position
         force_keep_input: bool = False,
     ) -> WorldModelOutput:
-        """Full-sequence forward pass.
+        """Full-sequence forward pass — vectorised over ``B*T`` frames.
 
-        Builds tokens from ``obs[t]`` + ``prev_actions[:,t]``, runs one
-        Transformer pass, then predicts reward at each position using the
-        corresponding belief + ``current_actions[:,t]``.
-
-        Parameters
-        ----------
-        obs:
-            ``(B, T, C, H, W)`` observation sequence.
-        prev_actions:
-            ``(B, T, A)`` — ``prev_actions[:,0]=zeros``,
-            ``prev_actions[:,t]=action[t-1]``.
-        current_actions:
-            ``(B, T, A)`` — ``current_actions[:,t]=action[t]``.
+        Perception (encoder → tokenizer → scorer → selector → spatial head)
+        is applied once to all ``B*T`` frames reshaped into a single batch.
+        Controller reward prediction is similarly vectorised.
         """
         B, T = obs.shape[0], obs.shape[1]
         input_dim = VALUES_DIM + ACTION_DIM
         device = obs.device
 
-        # Perception per frame.
-        all_tokens = torch.empty(B, T, input_dim, device=device)
-        kl_mus: list[torch.Tensor] = []
-        kl_logvars: list[torch.Tensor] = []
-        mask_softs: list[torch.Tensor] = []
-        indices_list: list[torch.Tensor] = []
+        # ----- Vectorised perception over B*T frames -----
+        frames = obs.reshape(B * T, *obs.shape[2:])  # (B*T, C, H, W)
 
-        for t in range(T):
-            img_t = obs[:, t]
-            h_spatial, m, idx, mu, lv = _perceive_frame(
-                self.encoder, self.tokenizer, self.scorer,
-                self.selector, self.spatial_hd, self.obs_drop,
-                img_t, force_keep_input,
-            )
-            all_tokens[:, t] = torch.cat([h_spatial, prev_actions[:, t]], dim=-1)
-            mask_softs.append(m)
-            indices_list.append(idx)
-            if mu is not None:
-                kl_mus.append(mu)
-                kl_logvars.append(lv)
+        feat = self.encoder(frames)                   # (B*T, C', H', W')
+        tok_out = self.tokenizer(feat)
 
-        # Single Transformer pass.
+        if isinstance(tok_out, torch.Tensor):
+            tokens = tok_out
+            tok_mu = None
+            tok_logvar = None
+        else:
+            tokens, tok_mu, tok_logvar = tok_out
+
+        logits = self.scorer(tokens)                  # (B*T, N)
+        selection_mask, indices = self.selector(logits)  # (B*T, N), (B*T, K)
+        h_spatial, attn_k = self.spatial_hd(tokens, logits, selection_mask, indices)  # (B*T, V)
+        h_spatial = self.obs_drop(h_spatial, force_keep=force_keep_input)
+
+        # ----- Build Transformer tokens -----
+        h_spatial_bt = h_spatial.view(B, T, -1)       # (B, T, values_dim)
+        all_tokens = torch.cat([h_spatial_bt, prev_actions], dim=-1)  # (B, T, input_dim)
+
+        # Aggregated per-frame outputs.
+        selection_mask_bt = selection_mask.view(B, T, -1)   # (B, T, N)
+        indices_bt = indices.view(B, T, -1)                  # (B, T, K)
+        if tok_mu is not None:
+            tok_mu_bt = tok_mu.view(B, T, *tok_mu.shape[1:])     # (B, T, P, D)
+            tok_logvar_bt = tok_logvar.view(B, T, *tok_logvar.shape[1:])
+        else:
+            tok_mu_bt = None
+            tok_logvar_bt = None
+
+        # ----- Single Transformer pass -----
         lengths = torch.full((B,), T, device=device, dtype=torch.long)
         all_out = self.world_hd(all_tokens, lengths=lengths, return_all=True)  # (B, T, D)
 
-        # Per-position reward predictions using current_actions.
-        all_rewards = []
-        for t in range(T):
-            _sr, r_t = self.controller(all_out[:, t], current_actions[:, t])
-            all_rewards.append(r_t)
-        reward_pred_seq = torch.cat(all_rewards, dim=1)  # (B, T)
+        # ----- Vectorised controller reward over B*T positions -----
+        out_bt = all_out.reshape(B * T, -1)            # (B*T, D)
+        curr_act_bt = current_actions.reshape(B * T, -1)  # (B*T, A)
+        _shared_bt, r_pred_bt = self.controller(out_bt, curr_act_bt)
+        reward_pred_seq = r_pred_bt.view(B, T)          # (B, T)
 
-        # Last position for API compat.
+        # Last position for API compatibility; reuse the vectorised prediction
+        # so ``reward_pred`` is exactly the final sequence prediction.
         belief_last = all_out[:, -1]
-        _sr, rp_last = self.controller(belief_last, current_actions[:, -1])
-
-        last_mask = mask_softs[-1] if mask_softs else torch.empty(B, 0, device=device)
-        last_idx = indices_list[-1] if indices_list else torch.empty(B, 0, dtype=torch.long, device=device)
-        if kl_mus:
-            tok_mu = torch.stack(kl_mus, dim=0).mean(dim=0)
-            tok_logvar = torch.stack(kl_logvars, dim=0).mean(dim=0)
-        else:
-            tok_mu = None
-            tok_logvar = None
+        rp_last = reward_pred_seq[:, -1:].contiguous()
 
         return WorldModelOutput(
             world_state=belief_last,
             reward_pred=rp_last,
-            mask_soft=last_mask,
-            indices=last_idx,
+            mask_soft=selection_mask_bt[:, -1],      # last frame's mask
+            indices=indices_bt[:, -1],                # last frame's indices
             history=all_tokens,
             lengths=lengths,
-            tok_mu=tok_mu,
-            tok_logvar=tok_logvar,
+            tok_mu=tok_mu_bt,
+            tok_logvar=tok_logvar_bt,
             reward_pred_seq=reward_pred_seq,
         )
 

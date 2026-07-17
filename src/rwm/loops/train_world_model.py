@@ -8,6 +8,8 @@ from typing import List, Dict, Optional
 import torch
 from torch.utils.data import DataLoader
 
+from rwm.config.config import NUM_WORKERS, PIN_MEMORY
+
 from rwm.data.rollout_dataset import (
     build_train_val_datasets,
     _collect_npz_files,
@@ -62,13 +64,17 @@ def train_world_model_loop(
         val_files, sequence_len=sequence_len, image_size=image_size,
     )
 
+    nw = config.data.num_workers if config is not None else NUM_WORKERS
+    pin_memory = config.data.pin_memory if config is not None else PIN_MEMORY
     train_loader = DataLoader(
         train_ds, batch_size=batch_size, shuffle=True,
-        drop_last=True, num_workers=4, pin_memory=True,
+        drop_last=True, num_workers=nw, pin_memory=pin_memory,
+        persistent_workers=nw > 0,
     )
     val_loader = DataLoader(
         val_ds, batch_size=batch_size, shuffle=False,
-        drop_last=False, num_workers=2, pin_memory=True,
+        drop_last=False, num_workers=nw, pin_memory=pin_memory,
+        persistent_workers=nw > 0,
     )
 
     # Dataset manifest

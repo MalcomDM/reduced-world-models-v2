@@ -6,6 +6,10 @@ This document is the engineering plan for moving the current repository from
 the legacy LSTM and behavior-memory controller toward the architecture defined
 in `technical_definitions.md`.
 
+The post-Stage-2 theory/evidence audit and matched-ablation protocol are in
+`architecture_validation_plan.md`. That document is the source of truth for
+the Stage 2.5 gates; this file retains the larger implementation sequence.
+
 The project is not starting from zero. The legacy LSTM path previously achieved
 acceptable end-to-end reward prediction. The immediate goal is to restore that
 validated checkpoint using the causal Transformer and the new shared controller
@@ -16,12 +20,12 @@ trunk before implementing Actor-Critic learning.
 ```text
 observation o_t
     → reduced perception p_t
-    → action-conditioned causal temporal model with a_t
-    → transition state s_{t+1}
-    → shared controller trunk u_{t+1}
-        ├── reward head: predicted immediate environment reward r_{t+1}
-        ├── Actor head: next-action distribution π(a_{t+1} | s_{t+1})
-        └── Critic head: expected future return V(s_{t+1})
+    + previous action a_{t-1} + causal history
+    → pre-action belief b_t
+    → shared controller trunk u_t
+        ├── Actor head: action distribution π(a_t | b_t)
+        ├── Critic head: expected future return V(b_t)
+        └── reward head: R(b_t, a_t) = predicted r_{t+1}
 ```
 
 The reward head is colocated with Actor and Critic so direct reward supervision
@@ -440,7 +444,7 @@ Do not build Actor-Critic on mixed Transformer/LSTM state interfaces.
 
 ### Validation Results
 
-The validation script ``scripts/validate_stage2.py`` runs four modes:
+The validation script ``scripts/evaluate_reward_prediction.py`` runs four modes:
 
 | Mode | Command | What it tests |
 |------|---------|---------------|
@@ -584,62 +588,208 @@ extremely sparse and noisy.  Future training should use either:
 - Human-collected demonstration data, or
 - Dramatically more random data (100k+ frames).
 
-#### Structured artifacts produced
+#### Retained artifacts
 
-The smoke run at ``runs/stage2-val/seed42_smoke/`` contains:
-
-- ``config.json`` — resolved ExperimentConfig
-- ``environment.json`` — Python, PyTorch, CUDA info
-- ``git_metadata.json`` — commit hash + dirty flag
-- ``dataset_manifest.json`` — file list, split, hashes
-- ``metrics.csv`` — per-epoch train loss, val MSE, val MAE, baseline MSE, gradient norms
-- ``checkpoint_best.pt`` / ``checkpoint_latest.pt`` — structured checkpoints
-- ``best_world_model.pt`` — legacy bare state_dict
-- ``probes/default_probe.npz`` — fixed probe set
+Transient smoke runs are intentionally not retained. Reproducible anchor
+artifacts (configuration, environment, manifest, metrics, structured
+checkpoint, and fixed probe set) are retained under
+``runs/component_refinement/00_reward_anchor_pre_kl_fix/seed_42/`` and
+``seed_43/``. The convention is recorded in
+``runs/component_refinement/RUN_INDEX.md``.
 
 ### Stage 2 Status
 
-**Structurally complete.  Experimentally blocked on data quality.**
+**Initial end-to-end anchor passed; research claims remain gated by Stage 2.5.**
 
-The timing contract, architecture, training pipeline, validation infrastructure,
-and structured artifacts are all correct and tested.  The model is not yet
-producing useful reward predictions because the available random-policy data
-does not provide a learnable signal.
+The timing contract and reward pipeline are connected and can overfit a
+nonconstant sequence. Two beta-zero checkpoints beat a constant-mean held-out
+baseline by 14--16 percent. This is sufficient evidence to preserve the model
+as an experimental anchor, but the later audit found that overlapping windows,
+startup/early-push effects, sparse random-policy rewards, and a weak baseline
+limit the conclusion.
 
-To pass Stage 2 experimentally, one of the following is needed:
-1. Collect rollout data from a non-random policy (e.g., human driver or a
-   simple heuristic controller).
-2. Scale to 100k+ random frames.
-3. Add a synthetic reward that depends on the action (for validation).
+The current evidence does **not** yet establish variational token similarity,
+benefit from learned Top-K, action-conditioned masked dynamics, or readiness for
+policy training. Stage 3 is therefore no longer authorized solely by the
+constant-mean comparison.
 
-Without one of these, Stage 3 (open-loop imagination) cannot be meaningfully
-evaluated: a model that cannot predict reward on observed transitions will
-also fail on imagined ones.
+## Stage 2.5 — Validate the Architecture Hypotheses
 
-## Stage 3 — Validate Open-Loop Imagination
+Detailed definitions, metrics, and gates are in
+`docs/architecture_validation_plan.md`.
+
+### A — Measurement foundation
+
+- Build seeded, immutable development/validation/test CarRacing scenarios.
+- Add competent human/heuristic trajectories and same-state branched action
+  sequences.
+- Evaluate each transition once with reward-event, horizon, startup, and HUD
+  strata plus stronger baselines.
+
+### B — Correct and accelerate the anchor
+
+**B.1 — KL reduction (COMPLETE).**
+The variational-token KL is now computed per posterior element before any
+reduction.  The exact contract is:
+
+```python
+kl_per_element = 0.5 * (mu^2 + exp(logvar) - 1 - logvar)
+kl = kl_per_element.mean()      # mean over (B, T, P, D)
+```
+
+``forward_sequence`` preserves the full ``(B, T, P, D)`` posterior shape
+instead of averaging over time before applying the nonlinear KL formula.
+The reusable helper ``kl_normal()`` in ``world_model_trainer.py`` implements
+this contract and is tested with known-posterior analytical values, a
+regression case proving that pre-averaging gives a different result, and
+gradient flow verification.
+
+| Test | Result |
+|------|--------|
+| ``kl_normal(mu=0, logvar=0) = 0`` | PASSED |
+| ``kl_normal(mu=1, logvar=0) = 0.5`` | PASSED |
+| Per-element KL > pre-averaged KL for non-constant posteriors | PASSED |
+| Gradients flow through KL with beta>0 | PASSED |
+| Changing one timestep changes KL | PASSED |
+| Full test suite with smoke training | 153 passed |
+
+**B.2 — Top-K straight-through gradients (COMPLETE).**
+The straight-through selection mask now flows into ``SpatialAttentionHead``
+instead of being discarded before pooling. The soft surrogate has total mass
+``K``, not sum-one. Training computes dense patch values for the surrogate so
+unselected scorer logits receive finite nonzero gradient; evaluation retains
+the original hard K-token value projection and pooling path. The training-only
+value projection expands from K=8 to N=225 tokens (28.1x for this small
+projection), so measured end-to-end throughput remains a later checkpoint;
+there is no all-token inference projection cost. See
+``docs/architecture_validation_plan.md`` for the exact equations.
+
+| Test | Result |
+|------|--------|
+| Eval forward equals legacy hard gather | PASSED |
+| Eval projects only K selected values | PASSED |
+| Non-selected tokens do not affect eval output | PASSED |
+| Unselected logits receive dense gradient | PASSED |
+| Eval is deterministic | PASSED |
+| Training has Gumbel-based variation | PASSED |
+| Model integration (shapes, trace parity) | PASSED |
+
+**B.3 — Sliding-window previous-action boundary (COMPLETE).**
+The predecessor action for each window is now the actual ``action[offset-1]``
+for mid-episode windows, rather than always zeros.  True episode starts
+(``offset == 0``) still use zeros.  ``RolloutDataset`` returns the new
+``predecessor_action`` field; the trainer uses it for ``prev_actions[:, 0]``.
+No predecessor crosses an episode boundary.
+
+| Test | Result |
+|------|--------|
+| Mid-episode window gets correct predecessor | PASSED |
+| Episode-start window gets zeros | PASSED |
+| Predecessor does not cross episode boundary | PASSED |
+| Spy test proves prev_action at t=0 uses batch predecessor | PASSED |
+| Trainer rejects a batch missing predecessor metadata | PASSED |
+| Full test suite | 166 passed |
+
+**Performance impact:** One additional ``(A,)`` tensor per sample — negligible.
+No model inference overhead.
+**B.4 — Corrected reward-prediction anchor experiment (COMPLETE).**
+A matched beta sweep (0.0, 0.01, 0.1 × seeds 42, 43) was run after all B.1–B.3
+fixes.  Results are in ``runs/component_refinement/01_corrected_reward_anchor/``.
+
+| Beta | Seed 42 ratio | Seed 43 ratio |
+|------|---------------|---------------|
+| 0.00 | 0.857         | 0.812         |
+| 0.01 | **0.828**     | 0.837         |
+| 0.10 | 0.865         | **0.791**     |
+
+All 6 runs beat the constant-mean baseline. Beta-weighted runs are competitive
+with beta=0.0, confirming that the corrected KL (B.1) no longer dominates the
+loss. ``beta=0.10`` has the best two-seed mean MSE/ratio, while ``beta=0.01``
+has the best worst-seed ratio and lowest two-seed variation. ``beta=0.10`` is
+the default for subsequent experiments: it retains stronger variational
+pressure while remaining reward-competitive. This is a deliberate research
+configuration, not a demonstrated universal optimum. Action-conditioning probe
+passes for all 6 checkpoints (4/4 unique predictions).
+
+- Compare a small nonlinear state-action reward head with the current additive
+  linear head.
+**B.5 — Vectorised B*T perception and controller (COMPLETE).**
+``forward_sequence`` now reshapes ``(B, T, ...)`` frames into ``(B*T, ...)``
+and runs encoder, tokenizer, scorer, selector, and spatial head in a single
+batched call.  Controller reward prediction is similarly vectorised over
+``(B*T)`` positions.  The causal Transformer and all other components are
+unchanged.
+
+| Metric | Before (per-frame) | After (B*T) | Speedup |
+|--------|-------------------|-------------|---------|
+| ms/step | 68.7 | 25.4 | **2.71x** |
+| windows/sec | 116.4 | 315.5 | **2.71x** |
+| Peak GPU (GB) | 0.272 | 0.561 | 2.06x |
+
+Eval-mode incremental/sequence parity holds exactly.  Full test suite passes.
+The benchmark measures preloaded synthetic compute only. A real end-to-end
+retrain must be timed separately because NPZ decompression, PIL transforms,
+and host-to-device loading are not included. The previously observed 10-epoch
+anchor runs took roughly 9 minutes per seed, not 90 minutes.
+
+### C — Perception ablations
+
+- Retrain learned/random/fixed/dense selection variants.
+- Compare `K=8/16/32`, deterministic/stochastic tokenization, corrected small
+  KL weights, and linear/nonlinear reward heads.
+- Measure task quality and mechanism statistics separately.
+
+### D — Masked dynamics gate
+
+- Warm up on visible observations, mask contiguous horizons 1/2/4/8/16, and
+  replay factual action sequences.
+- Compare correct, zero, and shifted action histories on controlled branches.
+- Decide whether finite Transformer context suffices or generated state must be
+  explicitly carried.
+
+### Stage 2.5 checkpoint
+
+- The corrected anchor matches or exceeds the current reward result on the
+  fixed suite.
+- Retained perception mechanisms beat declared matched baselines across seeds.
+- Masked reward predictions degrade gradually with horizon and respond to
+  state-conditioned action branches.
+- Runtime, MACs, latency, memory, and unique environment frames are reported.
+
+Only then proceed to general open-loop imagination and Actor-Critic training.
+
+## Stage 3 — Implement the Trainable Imagination Engine
+
+Stage 2.5D is the experimental gate for masked dynamics. Stage 3 does not
+repeat that validation: it turns the validated observed/masked transition
+semantics into a reusable, differentiable imagination interface for later
+Actor-Critic training.
 
 ### Implementation
 
-- Use one transition interface for observed and imagined steps.
-- Warm up from real observations, then continue with actions and observational
-  tokens absent.
-- Keep tensors intact; do not convert predicted rewards to Python floats inside
-  trainable rollout code.
-- Compare imagined continuations with held-out real continuations.
-- Evaluate open-loop error by horizon on fixed, held-out episodes and record
-  the gap between predicted and real cumulative return.
+- Implement one transition interface for observed and masked/imaged steps,
+  using the approved order: score `R(b_t, a_t)`, then advance with `a_t` and
+  the available/missing next observation.
+- Preserve tensors, gradients, histories, masks, and action timing; no Python
+  float conversion or implicit detach inside trainable rollout code.
+- Replace the inactive `RolloutSimulator` draft only after it agrees with the
+  Stage 2.5D evaluator on fixed factual continuations.
+- Define the bounded context/recursive-state policy selected by Stage 2.5D and
+  make it explicit in the interface.
 
 ### Checkpoint
 
-- Different actions from an identical history produce different predictions.
-- Multi-step cumulative reward error degrades gradually with horizon.
-- Open-loop rollouts remain finite and nonconstant.
+- Incremental observed steps and the interface's observed mode agree with the
+  validated factual model.
+- The interface reproduces the fixed masked-horizon evaluator's predictions.
+- Rollouts remain tensors with finite gradients and correct action/reward
+  phase alignment.
 - Deterministic evaluation is reproducible.
 
 ### Blocker
 
-Do not train a policy in a model that is action-insensitive or collapses after
-the first missing observation.
+Do not train a policy until Stage 2.5D has shown action-sensitive masked
+dynamics and this implementation reproduces that result exactly.
 
 ## Stage 4 — Implement Actor-Critic with Frozen World Model
 

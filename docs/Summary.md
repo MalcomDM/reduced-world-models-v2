@@ -1,5 +1,9 @@
 # Reduced World Models — Design Direction
 
+> Execution status, current evidence, and stage gates are maintained in
+> `README.md`, `architecture_validation_plan.md`, and
+> `implementation_plan.md`. This document is the concise design rationale.
+
 ## Context
 
 This project investigates whether a useful world model can emerge from reward pressure under strong perceptual and temporal constraints.
@@ -51,7 +55,10 @@ It acts as a temporal perceptual constraint: the temporal model must continue pr
 
 This is inspired by limited and discontinuous perceptual processing rather than by a literal fixed human visual frame rate.
 
-The temporal model is being migrated from an LSTM to a causal Transformer because sequential recurrent processing creates a major practical training bottleneck. The Transformer may perform more theoretical operations, but its parallelism can make it substantially more efficient on GPU for bounded context windows.
+The temporal model is a causal Transformer because a bounded causal context can
+be processed in parallel during training. This advantage is only realised when
+per-frame perception is batched; the current timestep loop and full-window
+incremental recomputation remain explicit performance work items.
 
 ### Controller block
 

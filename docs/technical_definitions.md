@@ -4,6 +4,9 @@
 
 This document consolidates the current architectural and training decisions for integrating an actor-critic controller into the Reduced World Models project.
 
+The implementation gaps, evidence limits, performance audit, and checkpointed
+validation protocol are maintained in `architecture_validation_plan.md`.
+
 The research goal is:
 
 > Learn a compact, reward-oriented internal world model whose representations are sufficient for effective control, without requiring exact visual reconstruction or explicit next-state supervision.
@@ -71,12 +74,12 @@ RGB observation
     ↓
 Reduced perception block
     ↓
-Action-conditioned temporal world state
+Pre-action temporal belief
     ↓
 Shared controller trunk
-    ├── Reward head  → predicted immediate environment reward
-    ├── Actor head   → action distribution
-    └── Critic head  → dense internal state value V(s)
+    ├── Actor head   → action distribution from b_t
+    ├── Critic head  → dense internal state value V(b_t)
+    └── Reward head  → predicted r_{t+1} from (b_t, a_t)
 ```
 
 The three heads belong to one integrated model.
@@ -87,25 +90,28 @@ The three heads belong to one integrated model.
 
 The reward head intentionally lives beside the Actor and Critic instead of
 inside the temporal block. All three heads consume a common interpretation of
-the action-conditioned world state. This gives the shared controller trunk a
-direct supervised anchor while Actor and Critic objectives are changing.
+the pre-action belief. The reward head additionally receives the selected
+current action. This gives the shared controller trunk a direct supervised
+anchor while Actor and Critic objectives are changing without creating a
+circular Actor input.
 
-Architectural ownership does not change temporal semantics. The temporal model
-must first encode the effect of the selected action in the transition state;
-the shared trunk then predicts the immediate reward associated with that
-transition. A preferred transition contract is:
+Architectural ownership does not change temporal semantics. The approved
+transition contract is:
 
 ```text
-perceptual state s_t + selected action a_t
-    → temporal transition state s_{t+1}
-    → shared controller interpretation u_{t+1}
-        ├── immediate reward prediction r_{t+1}
-        ├── value estimate V(s_{t+1})
-        └── next-action distribution π(a_{t+1} | s_{t+1})
+current reduced observation p_t + previous action a_{t-1} + history
+    → pre-action belief b_t
+    → shared controller interpretation u_t
+        ├── action distribution π(a_t | b_t)
+        ├── value estimate V(b_t)
+        └── reward prediction R(b_t, a_t) = r_{t+1}
+
+next step:
+    p_{t+1} when visible + a_t + history → b_{t+1}
 ```
 
-The exact dataset indexing must be tested against how Gymnasium stores the
-observation before `env.step(action)` and the reward returned by that step.
+The rollout dataset stores `obs[t]` before `env.step(action[t])` and stores the
+returned reward at `reward[t] = r_{t+1}`. This indexing is regression-tested.
 
 ---
 
@@ -134,20 +140,21 @@ The selected-token ratio does not equal effective image coverage because each to
 
 The temporal world model receives:
 
-- previous internal state;
 - current reduced perceptual representation when available;
-- current action or action history;
+- the previous action and causal action/history context;
 - temporal context.
 
 Conceptually:
 
 ```text
-s_t + a_t + optional perceptual tokens
+p_t + a_{t-1} + causal history
     → temporal world model
-    → s_{t+1}
+    → pre-action belief b_t
 ```
 
-The temporal state must be action-conditioned so that it can represent how the internal world is expected to evolve if a specific action is taken.
+The belief is conditioned on actions already taken. The Actor then selects
+`a_t`, the reward head evaluates `(b_t, a_t)`, and `a_t` enters the temporal
+context used to produce the next belief.
 
 ### Observational Dropout
 
@@ -160,6 +167,14 @@ At selected time steps, the temporal model must continue operating without fresh
 - temporal history.
 
 The current hypothesis is that useful action-conditioned dynamics can emerge naturally from this pressure.
+
+The motivating observational-dropout work recursively carries the model's
+generated state while observations are hidden. A finite-context causal
+Transformer may instead reconstruct a bounded belief from the last visible
+context and subsequent actions. These are not automatically equivalent. The
+implementation must be evaluated under contiguous masked horizons and must
+either preserve a generated state or demonstrate that the bounded context is
+sufficient before it is used for imagination.
 
 ### Explicit Next-State Head
 
@@ -586,7 +601,7 @@ Purpose:
 
 ### Actor Loss
 
-Should update:
+On factual real-environment objectives, may update in controlled stages:
 
 - Actor branch;
 - shared controller trunk;
@@ -596,6 +611,14 @@ Should update:
 Purpose:
 
 > Shape representations that make high-reward policies easier to learn.
+
+For an Actor objective computed from imagined learned rewards, dynamics and
+reward-model parameters are frozen during the Actor optimizer step. Gradients
+may pass through their operations to the chosen actions, but the Actor must not
+increase its objective by changing the model or reward predictor that defines
+that objective. Factual reward and Critic updates still provide the intended
+end-to-end shaping. Fully coupled imagined Actor gradients remain an explicit
+later ablation with reality checks, not the default contract.
 
 This full end-to-end flow is aligned with the thesis hypothesis:
 
@@ -622,10 +645,11 @@ only be introduced if measured conflicts require them.
 ## Imagined Trajectories
 
 ```text
-s_t
+b_t
 → Actor samples a_t
-→ temporal world model predicts s_{t+1}
-→ reward head predicts r_{t+1}
+→ reward head predicts R(b_t, a_t) = r_{t+1}
+→ temporal model advances with a_t and a missing/available p_{t+1}
+→ b_{t+1}
 → repeat
 ```
 
@@ -756,7 +780,8 @@ It remains one integrated three-stage system with specialized heads.
 7. Use imagined trajectories generated by the world model.
 8. Use GAE for Actor advantages.
 9. Use the GAE-derived return as a Critic target.
-10. Allow reward, Critic, and Actor losses to shape the model end-to-end.
+10. Allow factual reward, Critic, and real-return Actor losses to shape the
+    model end-to-end in measured stages.
 11. Control gradient influence through weighting rather than permanently freezing the world model.
 12. Reuse Dreamer’s progressive-training pattern.
 13. Deprioritize the custom memory as the main controller-learning mechanism.
@@ -765,6 +790,11 @@ It remains one integrated three-stage system with specialized heads.
 16. Place the reward head beside Actor and Critic on the shared controller trunk.
 17. Keep immediate environment reward and dense internal value as distinct signals.
 18. Use DreamerV3 stabilization patterns as defaults, but treat end-to-end Actor-Critic gradients into the world model as an explicit thesis experiment.
+19. Freeze reward/dynamics parameters during Actor-only updates based on
+    imagined learned rewards; test fully coupled imagination only as a guarded
+    ablation.
+20. Treat an explicit next-latent/DeepMDP loss as a fallback experiment, not a
+    prerequisite for observational-dropout dynamics.
 
 ---
 

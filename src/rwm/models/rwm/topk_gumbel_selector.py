@@ -1,54 +1,79 @@
+"""Differentiable Top-K via Gumbel-Softmax + Straight-Through Estimator (STE).
+
+Forward contract:
+- Evaluation: hard K-hot mask, deterministic.
+- Training: Gumbel-noise-tempered indices for hard mask, soft surrogate
+  ``K * softmax(logits / temperature)`` for backward.
+
+The STE mask sums to ``K`` in the soft surrogate, preserving the total
+selection mass.  In eval the mask is exactly K-hot.  The mask is used
+by ``SpatialAttentionHead`` to compute forward pooling weights and
+backward gradients.
+"""
+
+from typing import Tuple
+
 import torch
 import torch.nn as nn
-from torch import Tensor
 import torch.nn.functional as F
-from typing import Tuple
+from torch import Tensor
 
 from rwm.config.config import K
 
 
-
-
 class TopKGumbelSelector(nn.Module):
-	"""
-	Differentiable Top-K via Gumbel-Softmax + STE.
-	forward(logits) -> mask_soft, indices
-		- mask_soft: (B,N) values in [0,1], sums≈1
-		- indices:  (B,K) hard indices of selected tokens
-	"""
-	def __init__(self, k: int = K, temp: float = 1.0) -> None:
-		super().__init__()											# type: ignore[reportUnknownMemberType]
-		self.k = k
-		self.temp = temp
+    """Differentiable Top-K selector.
 
+    Parameters
+    ----------
+    k:
+        Number of selected tokens.
+    temp:
+        Temperature for Gumbel-Softmax and the soft surrogate.
+    """
 
-	@staticmethod
-	def sample_gumbel(shape: Tuple[int, ...], device: torch.device, eps: float=1e-20) -> Tensor:
-		"""Sample Gumbel(0,1) noise with the same dtype/device as inputs."""
-		U = torch.rand(shape, device=device)
-		return -torch.log(-torch.log(U + eps) + eps)
+    def __init__(self, k: int = K, temp: float = 1.0) -> None:
+        super().__init__()
+        self.k = k
+        self.temp = temp
 
+    @staticmethod
+    def _sample_gumbel(shape: Tuple[int, ...], device: torch.device, eps: float = 1e-20) -> Tensor:
+        U = torch.rand(shape, device=device)
+        return -torch.log(-torch.log(U + eps) + eps)
 
-	def forward(self, logits:Tensor) -> Tuple[Tensor, Tensor]:
-		"""
-		logits: (B, N)
-		returns:
-			mask_soft: (B, N) -- during training use this to multiply tokens
-			indices:   (B, K) -- the hard top-K indices (for inference or gather)
-		"""
-		B, N = logits.shape
+    def forward(self, logits: Tensor) -> Tuple[Tensor, Tensor]:
+        """Return (selection_mask, indices).
 
-		# 1) Decide which logits to top-k on
-		if self.training:
-			# only inject noise during training
-			gumbel_noise = self.sample_gumbel(shape=(B,N), device=logits.device)
-			topk_logits  = (logits + gumbel_noise) / self.temp
-		else:
-			# deterministic top-K in eval
-			topk_logits = logits
+        Parameters
+        ----------
+        logits:
+            ``(B, N)`` — scorer logits for all patches.
 
-		topk_indices = topk_logits.topk(self.k, dim=1).indices # (B, K)				# 2) Get hard top-k indices
-		mask_hard = torch.zeros_like(logits).scatter_(1, topk_indices, 1.0)			# 3) Build hard mask
-		mask_soft = F.softmax(logits / self.temp, dim=1)							# 4) Compute a "soft" mask via plain softmax on clean logits
-		mask = (mask_hard - mask_soft).detach() + mask_soft							# 5) Straight-through: use hard in forward, soft in backward
-		return mask, topk_indices
+        Returns
+        -------
+        selection_mask:
+            ``(B, N)`` — STE mask.  Forward: K-hot hard mask.
+            Backward: ``K * softmax(logits / temp)`` gradient.
+        indices:
+            ``(B, K)`` — hard Top-K indices (used for trace/debug).
+        """
+        B, N = logits.shape
+
+        # ---- Hard selection ----
+        if self.training:
+            noise = self._sample_gumbel((B, N), device=logits.device)
+            topk_logits = (logits + noise) / self.temp
+        else:
+            topk_logits = logits
+
+        indices = topk_logits.topk(self.k, dim=1).indices  # (B, K)
+        hard_mask = torch.zeros_like(logits).scatter_(1, indices, 1.0)  # (B, N) K-hot
+
+        # ---- Soft surrogate with total mass K ----
+        soft = F.softmax(logits / self.temp, dim=1)  # (B, N), sums to 1
+        soft_k = self.k * soft  # (B, N), sums to K
+
+        # ---- Straight-through: forward=hard, backward=soft_k ----
+        mask = (hard_mask - soft_k).detach() + soft_k
+        return mask, indices

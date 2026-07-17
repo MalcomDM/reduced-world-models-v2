@@ -130,15 +130,17 @@ def test_timing_contract_prev_action_is_zeros_at_t0_and_act_tminus1_after(
     for t in range(seq_len):
         rec = spy.records[t]
 
-        # prev_action: zeros at t=0, action[t-1] at t>0
+        # prev_action at t=0: predecessor_action from batch (zeros at true
+        # episode start, action[offset-1] mid-episode).
+        # prev_action at t>0: action[t-1].
         if t == 0:
-            expected_prev = torch.zeros(B, 3)
+            expected_prev = batch["predecessor_action"]
         else:
             expected_prev = act[:, t - 1, :]
 
         torch.testing.assert_close(
             rec["prev_action"], expected_prev,
-            msg=f"Step {t}: prev_action should be action[t-1] (zeros at t=0)",
+            msg=f"Step {t}: prev_action should be predecessor (t=0) or action[t-1] (t>0)",
         )
 
         # current_action: action[t] at every step
@@ -147,6 +149,27 @@ def test_timing_contract_prev_action_is_zeros_at_t0_and_act_tminus1_after(
             rec["current_action"], expected_curr,
             msg=f"Step {t}: current_action should be action[t]",
         )
+
+
+@pytest.mark.models
+def test_trainer_rejects_batch_without_predecessor_action(tmp_path: Path):
+    """Missing predecessor metadata must not silently restore the old reset."""
+    trainer = WorldModelTrainer(
+        train_loader=[],
+        out_dir=tmp_path / "out",
+        sequence_len=2,
+        epochs=1,
+        batch_size=1,
+    )
+    batch = {
+        "obs": torch.zeros(1, 2, 3, 64, 64),
+        "action": torch.zeros(1, 2, 3),
+        "reward": torch.zeros(1, 2),
+        "done": torch.zeros(1, 2, dtype=torch.bool),
+    }
+
+    with pytest.raises(KeyError, match="predecessor_action"):
+        trainer._compute_batch_loss(batch)
 
 
 @pytest.mark.models
@@ -189,6 +212,108 @@ def test_timing_contract_reward_head_receives_current_action(tmp_path: Path, mon
         target_full, expected,
         msg="Target must be reward[:, :sequence_len]",
     )
+
+
+@pytest.mark.models
+def test_mid_episode_window_gets_predecessor_action(tmp_path: Path):
+    """A mid-episode window must get the actual action before its offset
+    as the predecessor, not zeros."""
+    path = tmp_path / "rollout.npz"
+    # Create a rollout with known action values (steer[0]=1, steer[1]=2, ...)
+    rng = np.random.RandomState(42)
+    T = 50
+    obs = rng.randint(0, 255, size=(T, 64, 64, 3), dtype=np.uint8)
+    action = np.zeros((T, 3), dtype=np.float32)
+    action[:, 0] = np.arange(T, dtype=np.float32) + 1.0  # steer = t+1
+    action[:, 1] = 0.5
+    reward = rng.randn(T).astype(np.float32)
+    done = np.zeros(T, dtype=bool)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(path, obs=obs, action=action, reward=reward, done=done)
+
+    # Create a dataset and sample a mid-episode window at offset 5.
+    ds = RolloutDataset(root_dir=tmp_path, sequence_len=10, image_size=64)
+
+    # Find a sample with offset > 0
+    mid_ep_samples = [
+        (path, off) for (path, off) in ds.samples if off > 0
+    ]
+    assert len(mid_ep_samples) > 0, "Must have mid-episode windows"
+    sample_path, sample_offset = mid_ep_samples[0]
+
+    # Load that sample directly
+    with np.load(sample_path) as data:
+        expected_predecessor = torch.tensor(
+            data["action"][sample_offset - 1], dtype=torch.float32,
+        )
+
+    # Get the sample from the dataset
+    sample_idx = ds.samples.index((sample_path, sample_offset))
+    sample = ds[sample_idx]
+
+    assert "predecessor_action" in sample, "Dataset must return predecessor_action"
+    torch.testing.assert_close(
+        sample["predecessor_action"], expected_predecessor,
+        msg=(
+            f"Mid-episode window at offset {sample_offset} should get "
+            f"action[offset-1] as predecessor, got {sample['predecessor_action']}"
+        ),
+    )
+
+
+@pytest.mark.models
+def test_episode_start_window_gets_zero_predecessor(tmp_path: Path):
+    """A window at true episode start must have zeros as predecessor."""
+    path = tmp_path / "start.npz"
+    rng = np.random.RandomState(0)
+    obs = rng.randint(0, 255, size=(20, 64, 64, 3), dtype=np.uint8)
+    action = rng.uniform(-1, 1, size=(20, 3)).astype(np.float32)
+    reward = rng.randn(20).astype(np.float32)
+    done = np.zeros(20, dtype=bool)
+    np.savez_compressed(path, obs=obs, action=action, reward=reward, done=done)
+
+    ds = RolloutDataset(root_dir=tmp_path, sequence_len=10, image_size=64)
+
+    # Find offset-0 samples
+    start_samples = [
+        (p, off) for (p, off) in ds.samples if off == 0
+    ]
+    assert len(start_samples) > 0, "Must have episode-start windows"
+
+    sample = ds[ds.samples.index(start_samples[0])]
+    expected_zeros = torch.zeros(3, dtype=torch.float32)
+    torch.testing.assert_close(
+        sample["predecessor_action"], expected_zeros,
+        msg="Episode-start window should get zeros as predecessor",
+    )
+
+
+@pytest.mark.models
+def test_predecessor_does_not_cross_episode_boundary(tmp_path: Path):
+    """A window from one file must never get a predecessor from another file."""
+    # Create two separate rollout files
+    for i in range(2):
+        p = tmp_path / f"ep_{i}.npz"
+        rng = np.random.RandomState(i)
+        obs = rng.randint(0, 255, size=(20, 64, 64, 3), dtype=np.uint8)
+        action = np.full((20, 3), float(i + 1), dtype=np.float32)  # constant per file
+        reward = rng.randn(20).astype(np.float32)
+        done = np.zeros(20, dtype=bool)
+        np.savez_compressed(p, obs=obs, action=action, reward=reward, done=done)
+
+    ds = RolloutDataset(root_dir=tmp_path, sequence_len=10, image_size=64)
+
+    # All mid-episode samples should have predecessor from same file
+    for file_path, offset in ds.samples:
+        if offset > 0:
+            with np.load(file_path) as data:
+                expected = torch.tensor(data["action"][offset - 1], dtype=torch.float32)
+            idx = ds.samples.index((file_path, offset))
+            sample = ds[idx]
+            torch.testing.assert_close(
+                sample["predecessor_action"], expected,
+                msg=f"Predecessor must come from same file (offset={offset})",
+            )
 
 
 @pytest.mark.models

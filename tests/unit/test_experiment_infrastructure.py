@@ -70,7 +70,7 @@ class TestConfig:
         data = DataConfig()
         assert data.sequence_len == 16
         assert data.image_size == 64
-        assert data.num_workers == 8
+        assert data.num_workers == 6
 
         perception = PerceptionConfig()
         assert perception.conv_filters == [32, 64, 16]

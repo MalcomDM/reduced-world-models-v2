@@ -65,8 +65,9 @@ class DataConfig:
     image_size: int = 64
     val_ratio: float = 0.2
     include_done_in_train: bool = False
-    num_workers: int = 8
+    num_workers: int = 6
     pin_memory: bool = True
+    cache_dir: str = ""  # path to pre-built frame cache (empty = no cache)
 
     def to_dict(self) -> Dict[str, Any]:
         return _as_dict(self)

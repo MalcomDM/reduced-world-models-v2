@@ -20,14 +20,15 @@ class WorldModelOutput(NamedTuple):
 
     Fields
     ------
-    world_state:   ``(B, D)`` — latent temporal state s_{{t+1}}.
+    world_state:   ``(B, D)`` — pre-action temporal belief b_t.
     reward_pred:   ``(B, 1)`` — predicted immediate reward r_{{t+1}}.
     mask_soft:     ``(B, N)`` — soft Top-K mask over patch tokens.
     indices:       ``(B, K)`` — selected patch token indices.
     history:       ``(B, T', input_dim)`` — updated temporal history buffer.
     lengths:       ``(B,)`` — valid lengths in ``history``.
-    tok_mu:        ``(B, N_patches, D_token)`` or ``None`` — tokenizer mean.
-    tok_logvar:    ``(B, N_patches, D_token)`` or ``None`` — tokenizer log-variance.
+    tok_mu:        ``(B, T, P, D)`` or ``(B, P, D)`` or ``None`` — tokenizer mean
+                   (full sequence: ``(B, T, P, D)``; single frame: ``(B, P, D)``).
+    tok_logvar:    Same shape as ``tok_mu`` — tokenizer log-variance.
     """
     world_state: Tensor
     reward_pred: Tensor
@@ -121,12 +122,19 @@ class RolloutSample(TypedDict):
         reward[t] = r_{t+1}       reward from env.step(a_t)
         done[t]   = terminal_{t+1} whether s_{t+1} is terminal
 
+    ``predecessor_action`` is the action taken **before** this window starts:
+    ``action[offset-1]`` for mid-episode windows; zeros for true episode
+    starts (``offset == 0``).  This is used as ``prev_actions[:, 0]`` in
+    training so the first belief is conditioned on the correct previous
+    action rather than always zeros.
+
     Reference: `docs/transition_contract.md`
     """
     obs: Tensor         # shape (T, C, H, W)
     action: Tensor      # shape (T, A)   where A = 3 (steer, gas, brake)
     reward: Tensor      # shape (T,)
     done: Tensor        # shape (T,)  bool
+    predecessor_action: Tensor  # shape (A,); zeros only at a true episode start
 
 
 class ProbeSet(TypedDict):

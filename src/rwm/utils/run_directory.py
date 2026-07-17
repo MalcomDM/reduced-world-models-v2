@@ -95,6 +95,7 @@ def create_run_directory(
     config: ExperimentConfig,
     run_id: Optional[str] = None,
     runs_root: Path = _RUNS_ROOT,
+    output_dir: Optional[Path] = None,
 ) -> Path:
     """Create a structured run directory and persist configuration.
 
@@ -109,6 +110,10 @@ def create_run_directory(
         generated.
     runs_root:
         Root directory for all runs (default: ``runs/``).
+    output_dir:
+        Exact output directory. When supplied, it is created directly instead
+        of deriving ``runs_root / experiment_name / run_id``. It must not
+        already exist.
 
     Returns
     -------
@@ -121,7 +126,7 @@ def create_run_directory(
         run_id=run_id,
     )
 
-    run_dir = runs_root / experiment_name / run_id
+    run_dir = output_dir if output_dir is not None else runs_root / experiment_name / run_id
     run_dir.mkdir(parents=True, exist_ok=False)
 
     # Subdirectories

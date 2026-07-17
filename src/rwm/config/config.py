@@ -1,7 +1,7 @@
 # BASE CONFIG
 BATCH_SIZE    = 32   # 32 secuencias de 20 pasos por bach
 SAMPLE_BATCH  = 4    # 8 images when visualizing reconstructions
-NUM_WORKERS   = 8    # use half your logical cores for data loading
+NUM_WORKERS   = 6    # fastest measured end-to-end real-data epoch (profiled)
 PIN_MEMORY    = True # speeds up host→GPU transfer
 
 EPISODE_BATCH_SIZE = 16 
