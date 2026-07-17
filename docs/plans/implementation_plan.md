@@ -799,21 +799,21 @@ the action probe (4/4).  See ``runs/component_refinement/RUN_INDEX.md`` for
 the full table.
 
 **C.2B — K-ablation (COMPLETE).**
-Six cached runs at K=4/16/32 × seeds 42/43 (beta=0.1, linear reward head,
-10 epochs) compared against the K=8 vectorized anchor.
+Eight cached runs at K=4/8/16/32 × seeds 42/43 (beta=0.1, linear reward head,
+10 epochs).  K=8 was re-run under the same cached conditions alongside K=4/16/32.
 
 | K   | Seed | Ratio | Mean |
 |-----|------|-------|------|
 | 4   | 42   | 0.931 | 0.886 |
 | 4   | 43   | 0.841 |      |
-| 8   | 42   | 0.828 | 0.808 |
-| 8   | 43   | 0.787 |      |
+| 8   | 42   | 0.845 | 0.806 |
+| 8   | 43   | 0.767 |      |
 | 16  | 42   | 0.834 | 0.822 |
 | 16  | 43   | 0.809 |      |
 | 32  | 42   | 0.896 | 0.870 |
 | 32  | 43   | 0.843 |      |
 
-**Verdict:** K=8 and K=16 are essentially tied (mean ratio 0.808 vs 0.822).
+**Verdict:** K=8 and K=16 are essentially tied (mean ratio 0.806 vs 0.822).
 Both clearly outperform K=4 (0.886) and K=32 (0.870).  K=16 costs the same
 forward pass (CNN + tokenizer + scorer process all 225 patches regardless of
 K), so K=8 remains the default for computational efficiency.  See
