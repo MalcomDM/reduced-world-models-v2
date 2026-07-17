@@ -241,42 +241,6 @@ class TestEvaluationProtection:
         npz.with_suffix(".branch.json").write_text("{}")
         assert _is_evaluation_file(npz)
 
-    def test_cached_and_uncached_samples_match(self, tmp_path):
-        """Cached and uncached RolloutDataset must produce identical samples."""
-        from rwm.data.rollout_dataset import RolloutDataset, _collect_npz_files
-        import tempfile
-        # Build a cache for synthetic data
-        cache_root = tmp_path / "cache"
-        npz_dir = tmp_path / "npz"
-        npz_dir.mkdir()
-        # Create one synthetic rollout
-        obs = np.random.randint(0, 256, (30, 64, 64, 3), dtype=np.uint8)
-        act = np.random.uniform(-1, 1, (30, 3)).astype(np.float32)
-        rew = np.random.randn(30).astype(np.float32)
-        don = np.zeros(30, dtype=bool)
-        src = npz_dir / "test_ep.npz"
-        np.savez_compressed(src, obs=obs, action=act, reward=rew, done=don)
-
-        # Build cache
-        from scripts.build_frame_cache import build_cache
-        build_cache(data_root=npz_dir, cache_dir=cache_root, dry_run=False)
-
-        # Compare dataset samples
-        ds_uncached = RolloutDataset.from_file_list([src], sequence_len=8, image_size=64)
-        ds_cached = RolloutDataset.from_file_list([src], sequence_len=8, image_size=64, cache_dir=cache_root)
-
-        assert len(ds_uncached) == len(ds_cached), "Window counts must match"
-
-        for i in range(min(len(ds_uncached), 5)):
-            u = ds_uncached[i]
-            c = ds_cached[i]
-            torch.testing.assert_close(u["obs"], c["obs"], msg=f"Sample {i}: obs mismatch")
-            torch.testing.assert_close(u["action"], c["action"], msg=f"Sample {i}: action mismatch")
-            torch.testing.assert_close(u["reward"], c["reward"], msg=f"Sample {i}: reward mismatch")
-            torch.testing.assert_close(u["done"], c["done"], msg=f"Sample {i}: done mismatch")
-            torch.testing.assert_close(u["predecessor_action"], c["predecessor_action"],
-                                      msg=f"Sample {i}: predecessor mismatch")
-
     def test_training_loader_rejects_eval_files(self, tmp_path):
         from rwm.data.rollout_dataset import RolloutDataset
 

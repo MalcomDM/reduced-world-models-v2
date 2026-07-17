@@ -13,7 +13,6 @@ Usage:
 """
 
 import argparse
-import hashlib
 import json
 import time
 from pathlib import Path
@@ -22,20 +21,7 @@ import numpy as np
 from PIL import Image
 from torchvision import transforms
 
-_CACHE_SCHEMA_VERSION = 1
-
-
-def _file_sha256(path: Path) -> str:
-    h = hashlib.sha256()
-    h.update(path.read_bytes())
-    return h.hexdigest()
-
-
-def _episode_hash_key(source_path: Path, image_size: int) -> str:
-    """Deterministic cache key based on source content + preprocessing."""
-    sha = _file_sha256(source_path)
-    raw = f"{_CACHE_SCHEMA_VERSION}_{sha}_{image_size}_ToTensor_Resize"
-    return hashlib.sha256(raw.encode()).hexdigest()[:16]
+from rwm.data.cache_utils import cache_key, _CACHE_SCHEMA_VERSION, _TRANSFORM_SPEC, _DEFAULT_IMAGE_SIZE
 
 
 def build_cache(
@@ -66,7 +52,7 @@ def build_cache(
     start = time.time()
 
     for src in npz_files:
-        key = _episode_hash_key(src, image_size)
+        key = cache_key(src, image_size)
         cache_path = cache_dir / f"{key}.npy"
 
         if cache_path.exists():
@@ -116,11 +102,17 @@ def build_cache(
     }
 
     # Write manifest
+    file_map = {}
+    for src in npz_files:
+        try:
+            rel = str(src.relative_to(data_root))
+        except ValueError:
+            rel = src.name
+        file_map[rel] = cache_key(src, image_size)
     manifest = summary.copy()
-    manifest["file_map"] = {
-        str(src.relative_to(data_root)): _episode_hash_key(src, image_size)
-        for src in npz_files
-    }
+    manifest["transform_spec"] = _TRANSFORM_SPEC
+    manifest["image_size"] = image_size
+    manifest["file_map"] = file_map
     with open(cache_dir / "manifest.json", "w") as f:
         json.dump(manifest, f, indent=2, sort_keys=True)
 
@@ -128,42 +120,23 @@ def build_cache(
 
 
 def validate_cache(cache_dir: Path, data_root: Path, image_size: int = 64) -> list:
-    """Check that every cached file's key matches its source.
-
-    Returns list of issue strings (empty = valid).
-    """
-    transform = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Resize((image_size, image_size), antialias=True),
-    ])
+    """Check every cache entry using the shared `verify_cache_entry`."""
+    from rwm.data.cache_utils import load_manifest, verify_cache_entry
     issues = []
-
-    manifest_path = cache_dir / "manifest.json"
-    if not manifest_path.exists():
-        issues.append("manifest.json not found")
+    try:
+        manifest = load_manifest(cache_dir)
+    except ValueError as e:
+        issues.append(str(e))
         return issues
-
-    with open(manifest_path) as f:
-        manifest = json.load(f)
-
-    for rel_path, expected_key in manifest.get("file_map", {}).items():
+    for rel_path, _ in manifest.get("file_map", {}).items():
         src = data_root / rel_path
         if not src.exists():
             issues.append(f"Source missing: {src}")
             continue
-        actual_key = _episode_hash_key(src, image_size)
-        if actual_key != expected_key:
-            issues.append(f"Key mismatch for {rel_path}: expected {expected_key}, got {actual_key}")
-        cache_path = cache_dir / f"{expected_key}.npy"
-        if not cache_path.exists():
-            issues.append(f"Cache missing: {cache_path}")
-            continue
-        # Verify shape
-        arr = np.load(cache_path)
-        expected_shape = (arr.shape[0], 3, image_size, image_size)
-        if arr.shape != (arr.shape[0], 3, image_size, image_size):
-            issues.append(f"Shape mismatch for {cache_path.name}: {arr.shape}")
-
+        try:
+            verify_cache_entry(cache_dir, src, manifest.get("file_map", {}), image_size)
+        except ValueError as e:
+            issues.append(str(e))
     return issues
 
 
