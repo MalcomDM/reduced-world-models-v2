@@ -318,15 +318,41 @@ class ImaginedACTrainer:
             metrics["horizon"] = H
             metrics["imagined_reward_mean"] = rewards_t.mean().item()
 
-            steer = actions_t[..., 0]
-            gas = actions_t[..., 1]
-            brake = actions_t[..., 2]
-            metrics["steer_mean"] = steer.mean().item()
-            metrics["steer_std"] = steer.std().item()
-            metrics["gas_mean"] = gas.mean().item()
-            metrics["gas_std"] = gas.std().item()
-            metrics["brake_mean"] = brake.mean().item()
-            metrics["brake_std"] = brake.std().item()
+            # Sampled action statistics.
+            steer_s = actions_t[..., 0]
+            gas_s = actions_t[..., 1]
+            brake_s = actions_t[..., 2]
+            metrics["steer_mean"] = steer_s.mean().item()
+            metrics["steer_std"] = steer_s.std().item()
+            metrics["gas_mean"] = gas_s.mean().item()
+            metrics["gas_std"] = gas_s.std().item()
+            metrics["brake_mean"] = brake_s.mean().item()
+            metrics["brake_std"] = brake_s.std().item()
+
+            # Logstd and mode from the current policy over these states.
+            Ds = states.shape[-1]
+            flat_c = self.ac.encode(states.reshape(-1, Ds))
+            dist = self.ac.actor(flat_c)
+            logstd = dist.logstd.reshape(B_, H, ACTION_DIM)
+            mode_a = dist.mode().reshape(B_, H, ACTION_DIM)
+
+            metrics["steer_logstd_mean"] = logstd[..., 0].mean().item()
+            metrics["gas_logstd_mean"] = logstd[..., 1].mean().item()
+            metrics["brake_logstd_mean"] = logstd[..., 2].mean().item()
+            metrics["steer_mode_mean"] = mode_a[..., 0].mean().item()
+            metrics["gas_mode_mean"] = mode_a[..., 1].mean().item()
+            metrics["brake_mode_mean"] = mode_a[..., 2].mean().item()
+
+            # Near-bound rates (deterministic mode).
+            sm = mode_a[..., 0]
+            gm = mode_a[..., 1]
+            bm = mode_a[..., 2]
+            metrics["steer_sat_0.90"] = (sm.abs() > 0.90).float().mean().item()
+            metrics["steer_sat_0.98"] = (sm.abs() > 0.98).float().mean().item()
+            metrics["gas_sat_0.90"] = (gm > 0.90).float().mean().item()
+            metrics["gas_sat_0.98"] = (gm > 0.98).float().mean().item()
+            metrics["brake_sat_0.90"] = (bm > 0.90).float().mean().item()
+            metrics["brake_sat_0.98"] = (bm > 0.98).float().mean().item()
 
         return metrics
 
@@ -378,22 +404,33 @@ class ImaginedACTrainer:
             gas = actions_t[..., 1]
             brake = actions_t[..., 2]
 
-            def _sat(x, bound=0.98):
-                return (x.abs() > bound).float().mean().item() if True else \
-                       (x > bound).float().mean().item()
+            # Logstd from the policy at probe states.
+            Ds = states.shape[-1]
+            flat_c = self.ac.encode(states.reshape(-1, Ds))
+            probe_dist = self.ac.actor(flat_c)
+            ls = probe_dist.logstd.reshape(-1, H, ACTION_DIM)
 
             results[str(H)] = {
                 "imagined_return": imagined_return,
                 "value_mean": value_mean,
+                # Sampled-action stats (mode actions since deterministic=True).
                 "steer_mean": steer.mean().item(),
                 "steer_std": steer.std().item(),
-                "steer_saturation": _sat(steer),
                 "gas_mean": gas.mean().item(),
                 "gas_std": gas.std().item(),
-                "gas_saturation": (gas > 0.98).float().mean().item(),
                 "brake_mean": brake.mean().item(),
                 "brake_std": brake.std().item(),
-                "brake_saturation": (brake > 0.98).float().mean().item(),
+                # Logstd.
+                "steer_logstd_mean": ls[..., 0].mean().item(),
+                "gas_logstd_mean": ls[..., 1].mean().item(),
+                "brake_logstd_mean": ls[..., 2].mean().item(),
+                # Near-bound rates (deterministic mode).
+                "steer_sat_0.90": (steer.abs() > 0.90).float().mean().item(),
+                "steer_sat_0.98": (steer.abs() > 0.98).float().mean().item(),
+                "gas_sat_0.90": (gas > 0.90).float().mean().item(),
+                "gas_sat_0.98": (gas > 0.98).float().mean().item(),
+                "brake_sat_0.90": (brake > 0.90).float().mean().item(),
+                "brake_sat_0.98": (brake > 0.98).float().mean().item(),
             }
 
         return results

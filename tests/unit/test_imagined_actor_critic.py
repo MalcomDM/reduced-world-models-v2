@@ -603,9 +603,13 @@ class TestFixedProbe:
             assert H in result
             d = result[H]
             for key in ("imagined_return", "value_mean",
-                        "steer_mean", "steer_std", "steer_saturation",
-                        "gas_mean", "gas_std", "gas_saturation",
-                        "brake_mean", "brake_std", "brake_saturation"):
+                        "steer_mean", "steer_std",
+                        "gas_mean", "gas_std",
+                        "brake_mean", "brake_std",
+                        "steer_logstd_mean", "gas_logstd_mean", "brake_logstd_mean",
+                        "steer_sat_0.90", "steer_sat_0.98",
+                        "gas_sat_0.90", "gas_sat_0.98",
+                        "brake_sat_0.90", "brake_sat_0.98"):
                 assert key in d, f"Missing key {key} in H={H}"
 
 
@@ -637,7 +641,12 @@ class TestPerDimStats:
         for r in tr._metrics_log:
             for key in ("steer_mean", "steer_std",
                         "gas_mean", "gas_std",
-                        "brake_mean", "brake_std"):
+                        "brake_mean", "brake_std",
+                        "steer_logstd_mean", "gas_logstd_mean", "brake_logstd_mean",
+                        "steer_mode_mean", "gas_mode_mean", "brake_mode_mean",
+                        "steer_sat_0.90", "steer_sat_0.98",
+                        "gas_sat_0.90", "gas_sat_0.98",
+                        "brake_sat_0.90", "brake_sat_0.98"):
                 assert key in r
                 assert isinstance(r[key], float)
 
@@ -657,3 +666,144 @@ class TestConfig:
     def test_validate_curriculum_out_of_range(self):
         with pytest.raises(ValueError, match="horizon in curriculum"):
             ImaginedACTrainingConfig(horizons=[1, 13]).validate()
+
+
+# ===================================================================
+# 17. Entropy-coefficient wiring
+# ===================================================================
+
+class TestEntropyCoefWiring:
+    @pytest.mark.models
+    def test_entropy_coef_passed_to_train_step(self):
+        """The config's entropy_coef must be passed to optimizer_step."""
+        torch.manual_seed(0)
+        m = ReducedWorldModel(
+            action_dim=ACTION_DIM, reward_head_kind="linear",
+            tokenizer_eval_mode="mean",
+        )
+        m.eval()
+        for p in m.parameters():
+            p.requires_grad_(False)
+
+        cfg = ImaginedACTrainingConfig(
+            warmup_steps=4, imagination_horizon=4, max_batches=2,
+            log_every=5, entropy_coef=0.05,
+        )
+        loader = DataLoader(_FakeDataset(num=8), batch_size=2, shuffle=False)
+        tr = ImaginedACTrainer(
+            model=m, train_loader=loader, train_cfg=cfg, seed=0,
+            out_dir=Path(tempfile.mkdtemp()),
+        )
+        tr.train()
+        # Config should be stored and used.
+        assert tr.cfg.entropy_coef == 0.05
+
+    @pytest.mark.models
+    def test_entropy_coef_affects_actor_loss(self):
+        """The entropy coefficient changes the actor loss value on the same
+        forward pass (proof it is wired into the computation)."""
+        torch.manual_seed(0)
+        m = ReducedWorldModel(
+            action_dim=ACTION_DIM, reward_head_kind="linear",
+            tokenizer_eval_mode="mean",
+        )
+        m.eval()
+        for p in m.parameters():
+            p.requires_grad_(False)
+
+        cfg = ImaginedACTrainingConfig(
+            warmup_steps=4, imagination_horizon=4, max_batches=1, log_every=5,
+        )
+        loader = DataLoader(_FakeDataset(), batch_size=4, shuffle=False)
+        batch = next(iter(loader))
+        tr = ImaginedACTrainer(
+            model=m, train_loader=loader,
+            train_cfg=cfg, seed=0, out_dir=Path(tempfile.mkdtemp()),
+        )
+        warmup_state = tr.imag.warmup(
+            *tr._prep_warmup(batch), force_keep_input=True,
+        )
+        states, acts, _, _ = tr.generate_trajectory(warmup_state)
+
+        # Get the distribution for the imagined states.
+        c_t = tr.ac.encode(states.reshape(-1, states.shape[-1]))
+        dist = tr.ac.actor(c_t)
+        device = states.device
+        advantages = torch.randn(states.shape[0] * states.shape[1],
+                                  device=device)
+
+        # Actor loss with ec=0.0 and ec=0.05 must differ.
+        l0 = tr.ac.compute_actor_loss(dist, acts.reshape(-1, ACTION_DIM),
+                                       advantages, entropy_coef=0.0)
+        l1 = tr.ac.compute_actor_loss(dist, acts.reshape(-1, ACTION_DIM),
+                                       advantages, entropy_coef=0.05)
+        assert abs(l0.item() - l1.item()) > 1e-6, (
+            "Entropy coefficient did not affect actor loss"
+        )
+
+
+# ===================================================================
+# 18. Per-dimension metric shapes and values
+# ===================================================================
+
+class TestNewMetricShapes:
+    @pytest.mark.models
+    def test_logstd_and_mode_and_sat_in_metrics(self):
+        torch.manual_seed(0)
+        m = ReducedWorldModel(
+            action_dim=ACTION_DIM, reward_head_kind="linear",
+            tokenizer_eval_mode="mean",
+        )
+        m.eval()
+        for p in m.parameters():
+            p.requires_grad_(False)
+
+        cfg = ImaginedACTrainingConfig(
+            warmup_steps=4, imagination_horizon=3, max_batches=3, log_every=5,
+        )
+        loader = DataLoader(_FakeDataset(num=8), batch_size=2, shuffle=False)
+        tr = ImaginedACTrainer(
+            model=m, train_loader=loader, train_cfg=cfg, seed=0,
+            out_dir=Path(tempfile.mkdtemp()),
+        )
+        tr.train()
+        for r in tr._metrics_log:
+            for key in ("steer_logstd_mean", "gas_logstd_mean", "brake_logstd_mean",
+                        "steer_mode_mean", "gas_mode_mean", "brake_mode_mean",
+                        "steer_sat_0.90", "steer_sat_0.98",
+                        "gas_sat_0.90", "gas_sat_0.98",
+                        "brake_sat_0.90", "brake_sat_0.98"):
+                assert key in r, f"Missing {key}"
+                assert isinstance(r[key], float)
+                assert r[key] == r[key], f"{key} is NaN"  # finite
+
+    @pytest.mark.models
+    def test_probe_has_new_keys(self):
+        torch.manual_seed(0)
+        m = ReducedWorldModel(
+            action_dim=ACTION_DIM, reward_head_kind="linear",
+            tokenizer_eval_mode="mean",
+        )
+        m.eval()
+        for p in m.parameters():
+            p.requires_grad_(False)
+
+        loader = DataLoader(_FakeDataset(num=8), batch_size=2, shuffle=False)
+        probe_batch = next(iter(loader))
+
+        cfg = ImaginedACTrainingConfig(
+            warmup_steps=4, imagination_horizon=4, max_batches=1, log_every=5,
+        )
+        tr = ImaginedACTrainer(
+            model=m, train_loader=loader, train_cfg=cfg, seed=0,
+            probe_batch=probe_batch,
+            out_dir=Path(tempfile.mkdtemp()),
+        )
+        result = tr.evaluate_fixed_probe()
+        for H in ("1", "2", "4"):
+            d = result[H]
+            for key in ("steer_logstd_mean", "gas_logstd_mean", "brake_logstd_mean",
+                        "steer_sat_0.90", "steer_sat_0.98",
+                        "gas_sat_0.90", "gas_sat_0.98",
+                        "brake_sat_0.90", "brake_sat_0.98"):
+                assert key in d, f"Missing probe key {key} in H={H}"

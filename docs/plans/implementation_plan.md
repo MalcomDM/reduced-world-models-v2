@@ -1272,19 +1272,83 @@ comes from the target Critic evaluated on the final imagined state ``z_H``.
 - [x] Reproducible with fixed seed + mean tokenizer.
 - [x] Structured AC checkpoint round-trip works; anchor provenance recorded.
 
+### Stage 5.3 — First Frozen-Policy Evaluation in Real CarRacing (complete)
+
+**Training**: 2000 updates, entropy=0.03, curriculum [1,2,4], seed 42.
+Critic loss 0.071 → 0.011 (6.4×).  WM hash unchanged.
+
+**Real-environment evaluator** (``src/rwm/evaluation/real_env_evaluator.py``):
+
+- ``run_episode(model, ac, seed, manifest)`` — one episode with correct timing contract
+  (belief → Actor mode → predicted reward → env step → record).
+- ``run_zero_baseline(seed, manifest)`` — do-nothing comparison.
+- CSV/JSON persistence, locked-manifest validation (dev-only), plotting.
+
+**Results** (locked manifest dev seeds 100–102, 1000 steps each):
+
+| Policy | Seed 100 | Seed 101 | Seed 102 | Mean |
+|--------|:------:|:------:|:------:|:----:|
+| Actor | −74.1 | −76.9 | −74.9 | −75.3 |
+| Zero baseline | −92.6 | −93.4 | −92.8 | −92.9 |
+| Δ | +18.5 | +16.5 | +17.9 | +17.6 |
+
+The Actor consistently beats the baseline by ~18 points.  Action pattern is
+near-constant steer 0.63, gas 0.27, brake 0.03 — a single heuristic that
+keeps the car on the track but does not navigate corners.  Reward prediction
+MAE ≈ 0.16.  Artifacts are in
+``runs/imagined_actor_critic/stage5_3_eval_manifest_v2/`` and
+``runs/imagined_actor_critic/stage5_3_baseline_manifest_v2/``; both record
+manifest hash ``148a6cc22e6ab930``.
+
+**Non-conclusion**: −75 cumulative reward is far below solved driving (~900+).
+The policy learns a simple survive-on-track heuristic, not a driving strategy.
+No val/test seeds used.  WM frozen throughout.  An earlier inline-seed run
+(0–2) was discarded and deleted because it did not use the locked manifest.
+
+### Stage 5.2 — Entropy / Policy-Collapse Ablation (complete)
+
+**Protocol:** three matched runs at entropy coefficients 0.001, 0.01, 0.03,
+seed 42, B=8, curriculum [1,2,4], 500 updates.
+
+**Results** (``runs/imagined_actor_critic/entropy_ablation_seed42/RESULTS.md``):
+
+| Metric | ent=0.001 | ent=0.01 | ent=0.03 |
+|--------|:---------:|:---------:|:---------:|
+| Critic loss (last 50 median) | 0.020 | 0.019 | 0.022 |
+| Steer logstd (final) | −0.537 | −0.468 | **−0.283** |
+| Steer sampled std (final) | 0.227 | 0.308 | **0.474** |
+| Brake logstd (final) | −0.170 | 0.055 | **0.278** |
+| Steer mode mean (final) | 0.874 | 0.804 | **0.600** |
+| Entropy range (MC) | [−5.20, 1.34] | [−3.96, 1.35] | [−1.99, 1.36] |
+| WM hash unchanged | YES | YES | YES |
+| All finite | YES | YES | YES |
+
+**Key findings:**
+
+1. All three coefficients produce stable training — critic loss drops 3–4×,
+   no NaN/inf, WM hash unchanged.
+2. **Entropy=0.03 preserves the most action spread**: steer logstd −0.28 vs
+   −0.54, steer sampled std 0.47 vs 0.23.  Brake logstd stays positive.
+3. **Entropy=0.001 collapses steer and brake** to near-deterministic.
+4. No coefficient saturates action bounds (mode never exceeds ±0.98).
+5. Imagined reward is similar across conditions — not a useful diagnostic.
+
+**No default coefficient is selected.**  Entropy=0.03 looks best on spread
+diagnostics, but real-environment evaluation is required to confirm.
+
 ### Remaining (long training / real evaluation — not yet run)
 
-- Predicted return improvement across seeds and steps.
-- Actor entropy not collapsing.
+- Predicted return improvement.
+- Actor entropy not collapsing in real evaluation.
 - Critic error bounded as policy changes.
 - Real-environment evaluation after sufficient training.
 
-### Current blocker
+### Current blocker (for Stage 6)
 
 Long training and environment evaluation have not been run.  The
-implementation is mechanically correct (verified by 20 unit tests + smoke
-gate).  No reward-model exploitation or training instability can be assessed
-without extended runs.
+implementation is mechanically correct (verified by 33 unit tests + multiple
+smoke gates + ablation runs).  No reward-model exploitation or training
+stability can be assessed without extended runs.
 
 ## Stage 6 — Enable Controlled End-to-End Behavior Gradients
 

@@ -65,6 +65,10 @@ def main() -> None:
         help="Run a short smoke test (B=2, H=4, max_batches=10)",
     )
     parser.add_argument(
+        "--entropy-coef", type=float, default=None,
+        help="Entropy coefficient override (default: 0.001)",
+    )
+    parser.add_argument(
         "--data-dir", type=str, default="",
         help="Override the rollout data directory",
     )
@@ -136,6 +140,8 @@ def main() -> None:
         train_cfg.max_batches = args.max_batches
     if args.batch_size > 0:
         train_cfg.batch_size = args.batch_size
+    if args.entropy_coef is not None:
+        train_cfg.entropy_coef = args.entropy_coef
 
     train_cfg.validate()
 
