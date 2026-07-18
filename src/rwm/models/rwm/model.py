@@ -81,14 +81,17 @@ class ReducedWorldModel(nn.Module):
         selection_mode: str = "learned",
         selection_k: int = 8,
         selection_seed: int = 0,
+        tokenizer_eval_mode: str = "sample",
     ):
         super().__init__()
+        assert tokenizer_eval_mode in ("sample", "mean")
         self._reward_head_kind = reward_head_kind
         self._reward_head_hidden_dim = reward_head_hidden_dim
         self._selection_mode = selection_mode
         self._selection_k = selection_k
+        self._tokenizer_eval_mode = tokenizer_eval_mode
         self.encoder = Encoder()
-        self.tokenizer = TokenizationHead()
+        self.tokenizer = TokenizationHead(eval_mode=tokenizer_eval_mode)
         self.scorer = AttentionScorer()
         self.selector = TopKGumbelSelector(
             k=selection_k, selection_mode=selection_mode,
@@ -115,18 +118,26 @@ class ReducedWorldModel(nn.Module):
         history: Optional[torch.Tensor] = None,
         lengths: Optional[torch.Tensor] = None,
         force_keep_input: bool = False,
+        observation_keep: Optional[bool] = None,  # per-step; False=masked, True=visible, None=visible
     ) -> WorldModelOutput:
         """Incremental forward pass.
 
         Builds a belief from ``obs[t]`` and ``prev_action`` (action[t-1]),
         then predicts reward using that belief and ``current_action``
         (action[t]).
+
+        When ``observation_keep`` is False, the spatial representation is
+        replaced with zeros (the image is still processed for diagnostics).
         """
         h_spatial, mask_soft, indices, tok_mu, tok_logvar = _perceive_frame(
             self.encoder, self.tokenizer, self.scorer,
             self.selector, self.spatial_hd, self.obs_drop,
             img, force_keep_input,
         )
+
+        # Apply observation mask (per-step).
+        if observation_keep is False:
+            h_spatial = torch.zeros_like(h_spatial)
 
         # Token uses PREVIOUS action (action[t-1]).
         token_t = torch.cat([h_spatial, prev_action], dim=-1).unsqueeze(1)
@@ -172,12 +183,18 @@ class ReducedWorldModel(nn.Module):
         prev_actions: torch.Tensor, # (B, T, A) prev_actions[:,0]=zeros, prev_actions[:,t]=action[t-1]
         current_actions: torch.Tensor,  # (B, T, A) action[t] for reward head at each position
         force_keep_input: bool = False,
+        observation_keep: Optional[torch.Tensor] = None,  # (B, T) bool; True=visible, False=masked
     ) -> WorldModelOutput:
         """Full-sequence forward pass — vectorised over ``B*T`` frames.
 
         Perception (encoder → tokenizer → scorer → selector → spatial head)
         is applied once to all ``B*T`` frames reshaped into a single batch.
         Controller reward prediction is similarly vectorised.
+
+        When ``observation_keep`` is provided, spatial representations at
+        masked (False) positions are replaced with zeros, simulating an
+        unseen observation.  Perception still runs on all frames so that
+        diagnostic outputs (indices, masks) are available for visible frames.
         """
         B, T = obs.shape[0], obs.shape[1]
         input_dim = VALUES_DIM + ACTION_DIM
@@ -201,8 +218,13 @@ class ReducedWorldModel(nn.Module):
         h_spatial, attn_k = self.spatial_hd(tokens, logits, selection_mask, indices)  # (B*T, V)
         h_spatial = self.obs_drop(h_spatial, force_keep=force_keep_input)
 
-        # ----- Build Transformer tokens -----
+        # ----- Observation visibility mask -----
         h_spatial_bt = h_spatial.view(B, T, -1)       # (B, T, values_dim)
+        if observation_keep is not None:
+            keep_float = observation_keep.unsqueeze(-1).float()  # (B, T, 1)
+            h_spatial_bt = h_spatial_bt * keep_float
+
+        # ----- Build Transformer tokens -----
         all_tokens = torch.cat([h_spatial_bt, prev_actions], dim=-1)  # (B, T, input_dim)
 
         # Aggregated per-frame outputs.

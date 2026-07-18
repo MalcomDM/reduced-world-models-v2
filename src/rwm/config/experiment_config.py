@@ -99,6 +99,7 @@ class PerceptionConfig:
     values_dim: int = 32
     selection_mode: str = "learned"
     selection_seed: int = 0
+    tokenizer_eval_mode: str = "sample"
 
     def to_dict(self) -> Dict[str, Any]:
         return _as_dict(self)
@@ -159,6 +160,31 @@ class ControllerConfig:
 
 
 @dataclasses.dataclass(frozen=True)
+class TemporalMaskConfig:
+    """Temporal observation-masking curriculum for D.1 training.
+
+    When enabled, a contiguous block of steps after ``warmup_steps`` is
+    masked (spatial rep → zero) with per-sample probability that ramps
+    linearly from 0 to ``target_mask_probability`` over ``ramp_epochs``.
+    """
+    enabled: bool = False
+    warmup_steps: int = 4
+    horizons: List[int] = dataclasses.field(default_factory=lambda: [1, 2, 4, 8, 12])
+    target_mask_probability: float = 0.5
+    ramp_epochs: int = 2
+
+    def to_dict(self) -> Dict[str, Any]:
+        return _as_dict(self)
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "TemporalMaskConfig":
+        return _from_dict(cls, data)
+
+    def to_json(self) -> str:
+        return _serialize(self)
+
+
+@dataclasses.dataclass(frozen=True)
 class TrainingConfig:
     """Optimization and training loop."""
     batch_size: int = 32
@@ -170,12 +196,37 @@ class TrainingConfig:
     warmup_steps: int = 20
     error_threshold: float = 0.35
     kl_beta: float = 1.0
+    temporal_mask: TemporalMaskConfig = dataclasses.field(
+        default_factory=TemporalMaskConfig,
+    )
 
     def to_dict(self) -> Dict[str, Any]:
         return _as_dict(self)
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "TrainingConfig":
+        return _from_dict(cls, data)
+
+    def to_json(self) -> str:
+        return _serialize(self)
+
+
+@dataclasses.dataclass(frozen=True)
+class ActorCriticConfig:
+    """Actor-Critic head calibration configuration (Stage 4.0)."""
+    hidden_dim: int = 64
+    actor_lr: float = 3e-4
+    critic_lr: float = 3e-4
+    gamma: float = 0.997
+    lambda_: float = 0.95
+    entropy_coef: float = 1e-3
+    target_update_rate: float = 0.01
+
+    def to_dict(self) -> Dict[str, Any]:
+        return _as_dict(self)
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "ActorCriticConfig":
         return _from_dict(cls, data)
 
     def to_json(self) -> str:
@@ -201,6 +252,9 @@ class ExperimentConfig:
     )
     controller: ControllerConfig = dataclasses.field(
         default_factory=ControllerConfig
+    )
+    actor_critic: ActorCriticConfig = dataclasses.field(
+        default_factory=ActorCriticConfig,
     )
     training: TrainingConfig = dataclasses.field(
         default_factory=TrainingConfig

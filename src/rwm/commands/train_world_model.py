@@ -18,6 +18,7 @@ from rwm.config.experiment_config import (
     PerceptionConfig,
     ControllerConfig,
     TrainingConfig,
+    TemporalMaskConfig,
 )
 from rwm.loops.train_world_model import train_world_model_loop
 from rwm.utils.run_directory import create_run_directory, _RUNS_ROOT
@@ -96,6 +97,24 @@ def train_world_model(
     selection_seed: int = typer.Option(
         0, help="RNG seed for fixed_random selection",
     ),
+    tokenizer_eval_mode: str = typer.Option(
+        "sample", help="Tokenizer evaluation policy: sample or mean",
+    ),
+    temporal_mask_enabled: bool = typer.Option(
+        False, help="Enable temporal observation masking during training (D.1)",
+    ),
+    temporal_mask_warmup: int = typer.Option(
+        4, help="Visible warmup steps before mask starts",
+    ),
+    temporal_mask_horizons: str = typer.Option(
+        "1,2,4,8,12", help="Comma-separated approved mask horizons",
+    ),
+    temporal_mask_probability: float = typer.Option(
+        0.5, help="Target per-sample mask probability after ramp",
+    ),
+    temporal_mask_ramp_epochs: int = typer.Option(
+        2, help="Epochs over which mask probability ramps from 0 to target",
+    ),
 ):
     """Train a ReducedWorldModel on rollout data with held-out validation.
 
@@ -135,6 +154,7 @@ def train_world_model(
             k=selection_k,
             selection_mode=selection_mode,
             selection_seed=selection_seed,
+            tokenizer_eval_mode=tokenizer_eval_mode,
         ),
         controller=ControllerConfig(
             reward_head_kind=reward_head_kind,
@@ -144,6 +164,13 @@ def train_world_model(
             batch_size=batch_size,
             max_epochs=max_epochs,
             beta=beta,
+            temporal_mask=TemporalMaskConfig(
+                enabled=temporal_mask_enabled,
+                warmup_steps=temporal_mask_warmup,
+                horizons=[int(x) for x in temporal_mask_horizons.split(",")],
+                target_mask_probability=temporal_mask_probability,
+                ramp_epochs=temporal_mask_ramp_epochs,
+            ),
         ),
     )
 

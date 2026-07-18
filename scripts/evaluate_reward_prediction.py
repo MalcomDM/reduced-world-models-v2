@@ -37,7 +37,7 @@ from rwm.data.rollout_dataset import (
     _collect_npz_files,
 )
 from rwm.trainers.deterministic.world_model_trainer import WorldModelTrainer
-from rwm.config.experiment_config import ExperimentConfig, DataConfig, PerceptionConfig, ControllerConfig, TrainingConfig
+from rwm.config.experiment_config import ExperimentConfig, DataConfig, PerceptionConfig, ControllerConfig, TrainingConfig, TemporalMaskConfig
 from rwm.utils.run_directory import create_run_directory
 from rwm.utils.dataset_manifest import build_dataset_manifest, save_manifest
 from rwm.utils.seeding import set_seed
@@ -101,6 +101,12 @@ def run(
     selection_mode: str = "learned",
     selection_k: int = 8,
     selection_seed: int = 0,
+    tokenizer_eval_mode: str = "sample",
+    temporal_mask_enabled: bool = False,
+    temporal_mask_warmup: int = 4,
+    temporal_mask_horizons: Optional[List[int]] = None,
+    temporal_mask_probability: float = 0.5,
+    temporal_mask_ramp_epochs: int = 2,
 ) -> Dict:
     set_seed(seed)
 
@@ -117,6 +123,7 @@ def run(
             k=selection_k,
             selection_mode=selection_mode,
             selection_seed=selection_seed,
+            tokenizer_eval_mode=tokenizer_eval_mode,
         ),
         controller=ControllerConfig(
             reward_head_kind=reward_head_kind,
@@ -127,6 +134,13 @@ def run(
             max_epochs=max_epochs if not profile else 1,
             learning_rate=lr,
             beta=beta,
+            temporal_mask=TemporalMaskConfig(
+                enabled=temporal_mask_enabled,
+                warmup_steps=temporal_mask_warmup,
+                horizons=temporal_mask_horizons or [1, 2, 4, 8, 12],
+                target_mask_probability=temporal_mask_probability,
+                ramp_epochs=temporal_mask_ramp_epochs,
+            ),
         ),
     )
 
@@ -277,7 +291,8 @@ def run(
     return results
 
 
-def action_probe(checkpoint_path: Optional[Path] = None, seed: int = 42):
+def action_probe(checkpoint_path: Optional[Path] = None, seed: int = 42,
+                 tokenizer_eval_mode_override: Optional[str] = None):
     """Action sensitivity probe on a trained or fresh model."""
     set_seed(seed)
     from rwm.models.rwm.model import ReducedWorldModel
@@ -286,11 +301,22 @@ def action_probe(checkpoint_path: Optional[Path] = None, seed: int = 42):
     print("Loading model...")
     if checkpoint_path and checkpoint_path.exists():
         ckpt = load_checkpoint(checkpoint_path)
-        model = model_from_checkpoint(ckpt, action_dim=3)
+        model = model_from_checkpoint(ckpt, action_dim=3,
+                                      tokenizer_eval_mode_override=tokenizer_eval_mode_override)
+        saved_policy = getattr(ckpt.get("config"), "perception", None)
+        if saved_policy is not None:
+            saved_policy = getattr(saved_policy, "tokenizer_eval_mode", "sample")
+        else:
+            saved_policy = "sample"
+        effective_policy = model._tokenizer_eval_mode
         print(f"Loaded trained checkpoint: {checkpoint_path}")
+        print(f"  Tokenizer policy (saved): {saved_policy}")
+        print(f"  Tokenizer policy (runtime): {effective_policy}")
     else:
         print("Using FRESH (untrained) model")
         model = ReducedWorldModel(action_dim=3)
+        saved_policy = "sample"
+        effective_policy = "sample"
     model.eval()
 
     img = torch.randn(1, 3, 64, 64)
@@ -320,7 +346,13 @@ def action_probe(checkpoint_path: Optional[Path] = None, seed: int = 42):
 
     unique = len(set(round(p, 6) for p in preds))
     print(f"Unique predictions: {unique}/{len(probe_acts)}")
-    return {"preds": preds, "unique": unique, "passed": unique > 1}
+    return {
+        "preds": preds,
+        "unique": unique,
+        "passed": unique > 1,
+        "tokenizer_policy_saved": saved_policy,
+        "tokenizer_policy_runtime": effective_policy,
+    }
 
 
 def main():
@@ -352,6 +384,19 @@ def main():
                         help="Number of selected patches")
     parser.add_argument("--selection-seed", type=int, default=0,
                         help="RNG seed for fixed_random selection")
+    parser.add_argument("--tokenizer-eval-mode", type=str, default="sample",
+                        choices=["sample", "mean"],
+                        help="Tokenizer evaluation policy: sample (stochastic) or mean (deterministic)")
+    parser.add_argument("--temporal-mask-enabled", action="store_true",
+                        help="Enable temporal observation masking during training (D.1)")
+    parser.add_argument("--temporal-mask-warmup", type=int, default=4,
+                        help="Visible warmup steps before mask starts")
+    parser.add_argument("--temporal-mask-horizons", type=int, nargs="+", default=[1, 2, 4, 8, 12],
+                        help="Approved mask horizons")
+    parser.add_argument("--temporal-mask-probability", type=float, default=0.5,
+                        help="Target per-sample mask probability after ramp")
+    parser.add_argument("--temporal-mask-ramp-epochs", type=int, default=2,
+                        help="Epochs over which mask probability ramps from 0 to target")
     parser.add_argument("--checkpoint", type=Path, default=None,
                         help="Path to checkpoint for action probe")
     args = parser.parse_args()
@@ -359,7 +404,10 @@ def main():
     if args.checkpoint:
         action_probe_dir = args.out or Path("runs/reward_prediction/action_probe")
         action_probe_dir.mkdir(parents=True, exist_ok=True)
-        result = action_probe(args.checkpoint, seed=args.seed)
+        override = args.tokenizer_eval_mode
+        result = action_probe(args.checkpoint, seed=args.seed,
+                              tokenizer_eval_mode_override=override)
+        result["tokenizer_eval_mode_override"] = override
         with open(action_probe_dir / "action_probe_results.json", "w") as f:
             json.dump(result, f, indent=2)
         print(f"\nDone. Results saved to {action_probe_dir / 'action_probe_results.json'}")
@@ -390,6 +438,12 @@ def main():
             selection_mode=args.selection_mode,
             selection_k=args.selection_k,
             selection_seed=args.selection_seed,
+            tokenizer_eval_mode=args.tokenizer_eval_mode,
+            temporal_mask_enabled=args.temporal_mask_enabled,
+            temporal_mask_warmup=args.temporal_mask_warmup,
+            temporal_mask_horizons=args.temporal_mask_horizons,
+            temporal_mask_probability=args.temporal_mask_probability,
+            temporal_mask_ramp_epochs=args.temporal_mask_ramp_epochs,
         )
     except FileExistsError as error:
         parser.error(

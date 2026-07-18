@@ -21,10 +21,15 @@ from torch.utils.data import DataLoader
 import torch.nn.functional as F
 
 from rwm.config.config import ACTION_DIM
-from rwm.config.experiment_config import ExperimentConfig
+from rwm.config.experiment_config import ExperimentConfig, TemporalMaskConfig
 from rwm.types import RolloutSample, WorldModelOutput
 from rwm.models.rwm.model import ReducedWorldModel
 from rwm.utils.checkpointing import save_checkpoint
+from rwm.trainers.deterministic.temporal_mask import (
+    sample_mask,
+    current_mask_probability,
+    _validate_config as validate_mask_config,
+)
 
 
 def kl_normal(mu: Tensor, logvar: Tensor) -> Tensor:
@@ -79,14 +84,31 @@ class WorldModelTrainer:
         self.dataset_manifest_ref = dataset_manifest_ref
         self._global_step = 0
         self._last_train_reward_mean = 0.0
+        self._train_rng = torch.Generator(device="cpu")
+        self._train_rng.manual_seed(0)  # deterministic reproducibility
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        # Read temporal-mask config.
+        self._mask_cfg: TemporalMaskConfig = TemporalMaskConfig()
+        if config is not None and hasattr(config, "training"):
+            tc = config.training
+            if hasattr(tc, "temporal_mask"):
+                self._mask_cfg = tc.temporal_mask
+        if self._mask_cfg.enabled:
+            validate_mask_config(
+                self._mask_cfg.warmup_steps,
+                self._mask_cfg.horizons,
+                self.sequence_len,
+            )
+
         # Read architecture config.
         rh_kind = "linear"
         rh_hidden = 32
         sel_mode = "learned"
         sel_k = 8
         sel_seed = 0
+        tok_eval_mode = "sample"
         if config is not None:
             if hasattr(config, "controller"):
                 cc = config.controller
@@ -97,6 +119,7 @@ class WorldModelTrainer:
                 sel_mode = getattr(pc, "selection_mode", "learned")
                 sel_k = getattr(pc, "k", 8)
                 sel_seed = getattr(pc, "selection_seed", 0)
+                tok_eval_mode = getattr(pc, "tokenizer_eval_mode", "sample")
         self.model = ReducedWorldModel(
             action_dim=ACTION_DIM,
             reward_head_kind=rh_kind,
@@ -104,8 +127,11 @@ class WorldModelTrainer:
             selection_mode=sel_mode,
             selection_k=sel_k,
             selection_seed=sel_seed,
+            tokenizer_eval_mode=tok_eval_mode,
         ).to(self.device)
         self.optimizer = optim.Adam(self.model.parameters(), lr=self.lr)
+
+        self._current_mask_prob: float = 0.0
 
         self.out_dir = out_dir
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -116,7 +142,7 @@ class WorldModelTrainer:
     # Training
     # ------------------------------------------------------------------
 
-    def train_one_epoch(self) -> Tuple[float, float, float, float]:
+    def train_one_epoch(self, epoch: int = 1) -> Tuple[float, float, float, float]:
         self.model.train()
         total_losses: List[float] = []
         mse_losses: List[float] = []
@@ -124,6 +150,14 @@ class WorldModelTrainer:
         running_losses: deque[float] = deque(maxlen=20)
         reward_sum = 0.0
         reward_count = 0
+
+        # Update mask probability for this epoch (ramp schedule)
+        if self._mask_cfg.enabled:
+            self._current_mask_prob = current_mask_probability(
+                epoch,
+                self._mask_cfg.target_mask_probability,
+                self._mask_cfg.ramp_epochs,
+            )
 
         start = time.time()
         progress = tqdm(self.train_loader, desc="Training", leave=False)
@@ -217,10 +251,23 @@ class WorldModelTrainer:
             prev_actions[:, 1:] = act[:, :self.sequence_len - 1]
         current_actions = act[:, :self.sequence_len]
 
+        # Temporal observation mask (D.1)
+        observation_keep = None
+        if self._mask_cfg.enabled:
+            observation_keep = sample_mask(
+                B, self.sequence_len,
+                warmup_steps=self._mask_cfg.warmup_steps,
+                horizons=self._mask_cfg.horizons,
+                mask_probability=self._current_mask_prob,
+                rng=self._train_rng,
+                device=self.device,
+            )
+
         out: WorldModelOutput = self.model.forward_sequence(
             obs[:, :self.sequence_len],
             prev_actions, current_actions,
             force_keep_input=True,
+            observation_keep=observation_keep,
         )
 
         r_pred_seq = out.reward_pred_seq
@@ -289,7 +336,7 @@ class WorldModelTrainer:
 
     def fit(self) -> Path:
         for epoch in range(1, self.epochs + 1):
-            train_total, train_mse, train_kl, elapsed = self.train_one_epoch()
+            train_total, train_mse, train_kl, elapsed = self.train_one_epoch(epoch=epoch)
             val_metrics = self.evaluate()
 
             row: Dict[str, float] = {

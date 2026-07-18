@@ -139,9 +139,11 @@ class TestCheckpointCompat:
         """Save a nonlinear model, reload, and verify identical eval output."""
         import copy
         model1 = ReducedWorldModel(action_dim=3, reward_head_kind="nonlinear",
-                                   reward_head_hidden_dim=64)
+                                   reward_head_hidden_dim=64,
+                                   tokenizer_eval_mode="mean")
         model1.eval()
 
+        from rwm.config.experiment_config import PerceptionConfig
         cfg = ControllerConfig(reward_head_kind="nonlinear", reward_head_hidden_dim=64)
         ckpt_path = save_checkpoint(
             tmp_path / "nonlinear",
@@ -149,6 +151,7 @@ class TestCheckpointCompat:
             config=__import__("rwm.config.experiment_config",
                               fromlist=["ExperimentConfig"]).ExperimentConfig(
                 controller=cfg,
+                perception=PerceptionConfig(tokenizer_eval_mode="mean"),
             ),
         )
         loaded_ckpt = load_checkpoint(ckpt_path)

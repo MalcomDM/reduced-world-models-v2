@@ -41,8 +41,10 @@ class TokenizationHead(nn.Module):
 	pos_embed_buffer: ClassVar[Tensor] 
 
 
-	def __init__(self) -> None:
+	def __init__(self, eval_mode: str = "sample") -> None:
 		super().__init__()				# type: ignore[reportUnknownMemberType]
+		assert eval_mode in ("sample", "mean"), f"eval_mode must be 'sample' or 'mean', got {eval_mode!r}"
+		self.eval_mode = eval_mode
 		P, S, pad = PATCH_SIZE, PATCH_STRIDE, PATCH_PADDING
 
 		self.unfold = nn.Unfold(kernel_size=P, stride=S, padding=pad)		 # Unfold layer: (B, C, H, W) -> (B, C*P*P, N)
@@ -59,9 +61,15 @@ class TokenizationHead(nn.Module):
 		projected_patches = self.projection(patches)						# (B, N, TOKEN_DIM * 2)
 		mean, log_var = torch.chunk(projected_patches, 2, dim=-1)			# (B, N, TOKEN_DIM ) * 2
 
-		# 2) Reparameterization trick during training.  Evaluation uses the
-		# posterior mean so a fixed checkpoint gives stable reward predictions.
+		# 2) Sampling vs mean depends on mode:
+		#    - Training: always sample (reparameterisation trick).
+		#    - Eval with sample mode: sample from posterior (stochastic).
+		#    - Eval with mean mode: use posterior mean (deterministic).
 		if self.training:
+			std = torch.exp(0.5 * log_var)
+			eps = torch.randn_like(std)
+			tokens = mean + eps * std
+		elif self.eval_mode == "sample":
 			std = torch.exp(0.5 * log_var)
 			eps = torch.randn_like(std)
 			tokens = mean + eps * std

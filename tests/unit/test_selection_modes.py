@@ -393,10 +393,11 @@ class TestMultipleK:
 
 class TestCheckpointK16:
     def test_structured_restores_k16(self, tmp_path):
-        model = ReducedWorldModel(action_dim=3, selection_mode="learned", selection_k=16)
+        model = ReducedWorldModel(action_dim=3, selection_mode="learned", selection_k=16,
+                                  tokenizer_eval_mode="mean")
         model.eval()
         cfg = ExperimentConfig(
-            perception=PerceptionConfig(selection_mode="learned", k=16),
+            perception=PerceptionConfig(selection_mode="learned", k=16, tokenizer_eval_mode="mean"),
         )
         ckpt_path = save_checkpoint(tmp_path / "k16", model_state=model.state_dict(), config=cfg)
         ckpt = load_checkpoint(ckpt_path)

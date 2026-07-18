@@ -813,111 +813,478 @@ Eight cached runs at K=4/8/16/32 × seeds 42/43 (beta=0.1, linear reward head,
 | 32  | 42   | 0.896 | 0.870 |
 | 32  | 43   | 0.843 |      |
 
-**Verdict:** K=8 and K=16 are essentially tied (mean ratio 0.806 vs 0.822).
-Both clearly outperform K=4 (0.886) and K=32 (0.870).  K=16 costs the same
-forward pass (CNN + tokenizer + scorer process all 225 patches regardless of
-K), so K=8 remains the default for computational efficiency.  See
+**Verdict:** K=8 and K=16 are close (mean ratio 0.806 vs 0.822), while both
+clearly outperform K=4 (0.886) and K=32 (0.870).  K=8 remains the default
+because it gives the best observed ratio while preserving the intended tighter
+spatial-information bottleneck.  The current dense implementation has the same
+dominant CNN/tokenizer/scorer FLOPs for every K; K=8 leaves the strongest path
+to later sparse-inference savings.  See
 ``runs/component_refinement/RUN_INDEX.md`` for full details.
 
-### D — Masked dynamics gate
+**C.3 — Tokenizer evaluation policy (COMPLETE).**
 
-- Warm up on visible observations, mask contiguous horizons 1/2/4/8/16, and
-  replay factual action sequences.
-- Compare correct, zero, and shifted action histories on controlled branches.
-- Decide whether finite Transformer context suffices or generated state must be
-  explicitly carried.
+| Checkpoint | Policy | Mean ratio | Ratio σ | mean reproducible? | 4/4 probe |
+|-----------|--------|:----------:|:-------:|:------------------:|:---------:|
+| K=8 seed 42 | mean | **0.84529** | — | yes, bitwise | yes |
+| K=8 seed 42 | sample | 0.84768 | 0.00117 | — | yes |
+| K=8 seed 43 | mean | **0.76662** | — | yes, bitwise | yes |
+| K=8 seed 43 | sample | 0.77076 | 0.00371 | — | yes |
+
+**Verdict:** The mean policy is deterministic (bitwise identical across
+inference RNG seeds) and marginally better (lower MSE) than sample for both
+seeds.  Sample variance is low (σ ≤ 0.004 in ratio).  See
+``runs/component_refinement/06_tokenizer_eval_policy/RESULTS.md`` for full
+details.  ``mean`` becomes the default for future evaluation experiments.
+
+### D.0 — Masked factual evaluator (COMPLETE)
+
+The masked dynamics interface is a deterministic, testable factual
+observation-masking evaluator.  It is not imagination training.
+
+**Canonical semantics:**
+
+- Tokenizer evaluation mode ``mean``.
+- ``forward_sequence`` accepts an optional ``observation_keep: BoolTensor (B, T)``.
+  ``True`` = use spatial representation from image; ``False`` = replace spatial
+  representation with zeros.
+- ``forward()`` accepts an optional ``observation_keep: bool`` per step.
+- All-True ``observation_keep`` matches the existing visible output bitwise.
+- Actions remain explicit: ``token[t]`` uses previous action ``a[t-1]``;
+  reward prediction uses current action ``a[t]``.
+- The model receives no image-derived information during the contiguous masked
+  horizon, but it may use causal history and action history; factual images
+  become visible again after that horizon.
+- Perception (encoder → tokenizer → scorer → selector → spatial head) still
+  runs on masked frames for diagnostic transparency; only the spatial output
+  is zeroed.
+
+**Reusable evaluator** ``MaskedFactualEvaluator`` under
+``src/rwm/evaluation/masked_factual_evaluator.py``:
+
+- Takes a model, loader, warmup, mask horizon, and action variant.
+- Reports per horizon: transition count, MSE, MAE, baseline MSE, ratio,
+  visible-reference MSE, delta from visible, and policy/config provenance.
+- Three action-history variants applied only from the masked boundary onward
+  (the visible warmup always uses factual history):
+  a) **correct** — factual previous actions (``prev[:,0]=predecessor``)
+  b) **zero** — all-zero previous actions
+  c) **shifted** — ``prev[t] = actions[t]`` (uses current action as prev)
+- Current action into the reward head remains factual in all variants.
+
+**Tests (20 focused):**
+
+- Action-variant indexing contract (correct, zero, shifted).
+- Observation mask construction: warmup visible, masked horizon, clip to T.
+- All-visible mask equals existing visible ``forward_sequence`` output.
+- Fully masked output does not depend on image content.
+- Warmup image changes do affect masked outputs.
+- Masked-zone image changes do not affect masked outputs.
+- Outputs have finite values and preserve gradients.
+- Incremental ``forward()`` with ``observation_keep=False`` zeros spatial rep.
+- ``MaskedFactualEvaluator`` returns per-horizon results with finite metrics.
+- Legacy unmasked ``forward_sequence``/``forward`` unchanged.
+
+**Validation results** (see ``runs/component_refinement/07_masked_factual_dynamics/RESULTS.md``):
+
+- All masked ratios > 1.0 — expected; these anchors were trained with all
+  observations visible.  This is an interface sanity check, not evidence of
+  learned blind dynamics.
+- MSE degrades with shorter horizon (more masking).
+- ``correct`` variant dominates ``zero`` and ``shifted`` — factual previous-action
+  history provides useful temporal context even without visual input.
+- ``zero`` (no action history) is consistently worst.
+- Seed 43 has larger masked losses under this protocol; this is descriptive,
+  not evidence for a causal attribution about visual reliance.
+- Aggregate delta from visible decreases with longer horizons, but those
+  horizons score different later transition sets; it is not evidence that more
+  blind context helps.
+
+**Important caveat:** The existing reward anchors (C.0–C.2B) were trained with
+all observations visible.  Their masked results are a structural sanity check
+of the interface, not evidence of learned blind dynamics, imagination ability,
+or policy readiness.  No training or fine-tuning has been performed for masked
+operation; the model has never seen masked training examples.
+
+**Unit coverage:** 22 focused tests in ``tests/unit/test_masked_dynamics.py``
+plus CLI import tests.  Full suite: 291 passed.
+
+### D.1 — Temporal observational-dropout training (COMPLETE)
+
+**Training results** (``runs/component_refinement/08_masked_reward_anchor/``):
+
+| Model | Seed 42 visible ratio | Seed 43 visible ratio |
+|-------|:---------------------:|:---------------------:|
+| Frozen visible-only (Stage 2.5C) | 0.845 | 0.767 |
+| Masked-trained | 0.882 | 0.853 |
+
+**Masked factual reward prediction (correct action history):**
+
+| Seed | Frozen ratio range | Masked-trained ratio range | All horizons improve? |
+|:----:|:------------------:|:--------------------------:|:--------------------:|
+| 42 | 1.076–1.338 | **0.928–0.954** | YES (15/15) |
+| 43 | 1.209–2.824 | **0.865–0.925** | YES (15/15) |
+
+Every single masked evaluation (3 variants × 5 horizons × 2 seeds = 30
+comparisons) improves relative to the frozen visible-only anchor.  Visible
+reward quality degrades moderately (seed 42: +0.037; seed 43: +0.086) but
+remains below 1.0 and passes the 4/4 action probe.
+
+**Verdict:** The temporal mask curriculum successfully teaches masked reward
+prediction.  The D.1 gate is satisfied.  Stage 3 can proceed with the
+masked-trained anchor for its imagination interface.
 
 ### Stage 2.5 checkpoint
 
 - The corrected anchor matches or exceeds the current reward result on the
   fixed suite.
 - Retained perception mechanisms beat declared matched baselines across seeds.
-- Masked reward predictions degrade gradually with horizon and respond to
-  state-conditioned action branches.
+- D.1 demonstrates improved masked factual reward prediction relative to the
+  visible-only anchor, without collapsing visible reward quality.
 - Runtime, MACs, latency, memory, and unique environment frames are reported.
 
 Only then proceed to general open-loop imagination and Actor-Critic training.
 
-## Stage 3 — Implement the Trainable Imagination Engine
+## Stage 3 — Differentiable Bounded-Context Imagination Interface (COMPLETE)
 
-Stage 2.5D is the experimental gate for masked dynamics. Stage 3 does not
-repeat that validation: it turns the validated observed/masked transition
-semantics into a reusable, differentiable imagination interface for later
-Actor-Critic training.
+Stage 2.5D.1 is the experimental gate for masked dynamics. Stage 3 turns the
+validated observed/masked transition semantics into a reusable, differentiable
+imagination interface for Actor-Critic training (Stage 4).
+
+### State semantics (implemented)
+
+At time ``t``, the causal state contains raw token history ``H_t`` through::
+
+    token[t] = cat(spatial_rep(obs[t]), action[t-1])
+    z_t = Transformer(H_t)                          — belief
+    T ̂_hat[t] = Reward(z_t, action[t])               — score
+    H_{t+1} = append(H_t, cat(zero_spatial, action[t]))  — advance
+
+Imagined steps have no image input.  The spatial representation is replaced
+with zeros; the action from the previous step provides the temporal context.
 
 ### Implementation
 
-- Implement one transition interface for observed and masked/imaged steps,
-  using the approved order: score `R(b_t, a_t)`, then advance with `a_t` and
-  the available/missing next observation.
-- Preserve tensors, gradients, histories, masks, and action timing; no Python
-  float conversion or implicit detach inside trainable rollout code.
-- Replace the inactive `RolloutSimulator` draft only after it agrees with the
-  Stage 2.5D evaluator on fixed factual continuations.
-- Define the bounded context/recursive-state policy selected by Stage 2.5D and
-  make it explicit in the interface.
+File ``src/rwm/imagination.py``:
 
-### Checkpoint
+**ImaginationRollout** (``nn.Module``):
 
-- Incremental observed steps and the interface's observed mode agree with the
-  validated factual model.
-- The interface reproduces the fixed masked-horizon evaluator's predictions.
-- Rollouts remain tensors with finite gradients and correct action/reward
+- ``warmup(obs, prev_actions, current_actions) → ImaginationState``:
+  Runs ``forward_sequence`` for vectorised perception and extracts per-step
+  causal beliefs via a re-entrant ``world_hd`` call. Returns ``history``
+  (``B, T, V+A``) and ``beliefs`` (``B, T, D``).
+
+- ``score(belief, action) → (B, 1)``:
+  ``ControllerTrunk.encode + predict_reward``.  Pure tensor-in/tensor-out.
+
+- ``advance(history, lengths, action) → (new_history, new_lengths, new_belief)``:
+  Builds blind token ``cat(zeros, action)``, appends via ``HistoryBuffer``
+  (left-truncation preserved), runs ``world_hd``.  No perception/CNN called.
+
+- ``rollout(history, lengths, initial_belief, actions (B, H, A)) → RolloutOutput``:
+  Per-step score-then-advance loop.  Returns ``states (B, H, D)``,
+  ``rewards (B, H)``, ``next_state (B, D)``, accumulated ``history`` and
+  ``lengths``.  Gradient-preserving throughout.
+
+**Data containers:**
+
+- ``ImaginationState``: ``history``, ``lengths``, ``beliefs``, ``current_belief``.
+- ``RolloutOutput``: ``states``, ``actions``, ``rewards``, ``next_state``,
+  ``history``, ``lengths``.
+
+**Design decisions:**
+
+- Never uses ``torch.no_grad()``, ``.item()``, or ``.detach()`` in trainable
+  paths.  Gradients flow from imagined rewards through to action tensors and
+  world-model parameters.
+- Uses ``HistoryBuffer`` for canonical bounded-context truncation (no
+  duplication of truncation rules).
+- The inactive ``RolloutSimulator`` draft is preserved for LSTM comparison
+  but is NOT used by any active code path.
+
+### Tests (21 tests in ``tests/unit/test_imagination.py``)
+
+1. **Warmup matches forward_sequence** — history tokens and beliefs identical.
+2. **Warmup matches incremental forward** — step-by-step ``model.forward()``
+   produces the same history as a single ``warmup()`` call.
+3. **Advance matches D.0 masked** — a single blind advance reproduces the
+   first masked-position belief from ``forward_sequence`` with
+   ``observation_keep`` masking.
+4. **Multi-step shapes and truncation** — correct tensor shapes, history
+   truncated at ``SEQ_LEN``, warmup prefix preserved, score order proved.
+5. **Score-then-advance timing spy** — first score uses the initial belief
+   and the correct action; second belief differs after advance.
+6. **Gradient flow** — gradients from summed imagined rewards reach both
+   the input action tensor and the world model's transformer/controller
+   parameters.  Warmup history does not block gradients.
+7. **No future observation** — imagined tokens have zero spatial
+   representation; rewards are deterministic given the same actions.
+8. **Existing APIs unchanged** — ``forward_sequence`` and incremental
+   ``forward`` still work identically.
+
+**Full suite: 309 passed** (21 new imagination tests, no regressions).
+
+### Checkpoint (all satisfied)
+
+- [x] Incremental observed steps and the interface's observed mode agree with
+  the validated factual model.
+- [x] The interface reproduces the fixed masked-horizon evaluator's predictions.
+- [x] Rollouts remain tensors with finite gradients and correct action/reward
   phase alignment.
-- Deterministic evaluation is reproducible.
+- [x] Deterministic evaluation is reproducible.
+- [x] No future observation can affect imagined states/rewards.
+- [x] Existing visible reward APIs unchanged.
 
-### Blocker
+### Blocker resolved
 
-Do not train a policy until Stage 2.5D has shown action-sensitive masked
-dynamics and this implementation reproduces that result exactly.
+Stage 2.5D.1 produced action-sensitive masked dynamics.  This implementation
+reproduces those results exactly.  The gate for Stage 4 is open.
 
-## Stage 4 — Implement Actor-Critic with Frozen World Model
+### Next: Stage 4 — Actor-Critic Head Calibration
 
-### Implementation
+## Stage 4 — Actor-Critic Head Calibration (Frozen World Model) (COMPLETE)
 
-- Add the shared Actor branch and Critic branch.
-- Define a bounded continuous distribution for steering, gas, and brake.
-- Implement stochastic training actions and deterministic evaluation actions.
-- Implement log probabilities, entropy, terminal-aware lambda returns/GAE, and
-  a slow or target Critic using DreamerV3 patterns where applicable.
-- Freeze perception and temporal parameters for this checkpoint.
+### New files
 
-### Checkpoint
+- ``src/rwm/distributions.py`` — ``BoundedGaussian`` distribution
+- ``src/rwm/models/actor_critic.py`` — Actor, Critic, ActorCritic, losses
+- ``tests/unit/test_actor_critic.py`` — 36 tests
 
-- Distribution samples and deterministic actions respect CarRacing bounds.
-- GAE matches hand-calculated trajectories including termination.
-- Critic overfits known synthetic returns.
-- Positive and negative advantages move action likelihood in the correct
+### Config
+
+``ActorCriticConfig`` added to ``src/rwm/config/experiment_config.py``
+(``frozen=True``, serializable).  Fields: ``hidden_dim=64``, ``actor_lr=3e-4``,
+``critic_lr=3e-4``, ``gamma=0.997``, ``lambda_=0.95``, ``entropy_coef=1e-3``,
+``target_update_rate=0.01``.
+
+### Distribution: ``BoundedGaussian``
+
+- Dim 0 (steering): ``tanh`` → ``[-1, 1]``.
+- Dims 1, 2 (gas, brake): ``sigmoid`` → ``[0, 1]``.
+- ``rsample()`` — reparameterized (gradients flow through).
+- ``mode()`` — deterministic (squashed mean).
+- ``log_prob(action)`` — inverse transform + change-of-variables correction.
+- ``entropy()`` — raw Gaussian approximation.
+
+### Actor head: ``80 → 64 → (mean, logstd)`` for 3 actions.
+
+One hidden ReLU layer.  ``logstd`` clamped to ``[-10, 2]``.
+
+### Critic head: ``80 → 64 → scalar V(c_t)``.
+
+One hidden ReLU layer.  Output is ``(B, 1)``.
+
+### Combined module: ``ActorCritic``
+
+Freezes the full ``ReducedWorldModel`` (including ``ControllerTrunk``).
+Owns ``actor``, ``critic``, ``target_critic`` (Polyak-updated).  Two
+separate Adam optimisers for actor and critic.
+
+**Key method ``optimizer_step``**:
+
+1. ``c_t = encode(z_t).detach()`` — world-model gradient block.
+2. ``dist = actor(c_t)``, ``values = critic(c_t)``.
+3. ``target_values = target_critic(c_t)`` (``no_grad``).
+4. ``advantages = TD(λ=0) residual``.
+5. Actor loss: ``-mean(stopgrad(adv) * log_prob) - entropy_coef * entropy``.
+6. Critic loss: ``MSE(values, λ-returns)``.
+7. Backprop each, step optimisers, Polyak-update target.
+
+### λ-return computation
+
+Backward recurrence::
+
+    G_t = r_t + γ * continuation_t *
+          ((1 - λ) * V_target(s_{t+1}) + λ * G_{t+1})
+
+where ``V_target(s_{t+1}) = bootstrap_values[:, t+1]`` for ``t < T-1``,
+and ``V_target(s_T) = bootstrap_value`` (a separate ``(B,)`` argument).
+
+### Termination / continuation contract
+
+Two boolean flags per step:
+
+- ``terminated[t] = True``
+    True environment terminal state.  ``continuation[t]`` must be False.
+    Return target is ``r_t`` — no bootstrap.
+
+- ``terminated[t] = False, continuation[t] = True``
+    A valid next state exists (truncation or continuation).  Standard λ-return
+    bootstrap applies.
+
+- ``terminated[t] = False, continuation[t] = False``
+    An explicit non-bootstrap boundary. Return target is ``r_t``. This is
+    not the normal imagined-horizon case: a rollout produced by Stage 3 has
+    a valid final latent state and therefore uses ``continuation=True`` plus
+    its target-critic ``bootstrap_value``.
+
+- ``terminated[t] = True, continuation[t] = True``
+    **Invalid** — raises ``ValueError`` with position index.
+
+``bootstrap_value (B,)`` provides ``V_target(s_T)``, used only when
+``continuation[:, -1]`` is True.
+
+### Entropy
+
+``BoundedGaussian.entropy()`` — raw-Gaussian approximation (lower bound,
+cheap, documented as such).
+
+``BoundedGaussian.entropy_sample()`` — single-sample Monte-Carlo estimate
+through the full squashed distribution.  Has finite gradients and is used
+by the actor loss.  The distinction is documented in code and tested.
+
+### Tests (42 tests, all pass)
+
+1. **Action bounds** — ``rsample`` and ``mode`` respect ``[-1, 1]`` /
+   ``[0, 1]``.
+2. **Deterministic repeatability** — ``mode`` reproducible; ``rsample``
+   has valid gradients.
+3. **log_prob finite near bounds** — finite and in plausible range.
+4. **λ-returns with new contract** — 7 scenarios: no-discount, single-step
+   bootstrap, λ=0/1, terminated mid-sequence, truncated final bootstrap,
+   explicit no-bootstrap boundary, imagined-horizon final bootstrap,
+   hand-calculated two-step.
+5. **Termination/continuation semantics** — terminated steps produce no
+   bootstrap; truncated steps use supplied bootstrap value; imagined-
+   horizon uses the final latent target value when available; an explicitly
+   non-bootstrap boundary is reward-only.
+6. **Critic overfits** — synthetic return dataset memorised.
+7. **Advantage direction** — positive → increased log-prob; negative →
+   decreased log-prob.
+8. **Entropy direction** — higher entropy coefficient → higher entropy.
+9. **Target Critic Polyak update** — hard initial copy + blending verified.
+10. **Freeze contract** — world-model params bitwise unchanged after 10
+    optimizer steps.
+11. **Validation** — ``terminated=True, continuation=True`` raises
+    ``ValueError``; non-bool dtypes raise ``TypeError``; shape mismatches
+    raise ``ValueError``; propagates through ``optimizer_step``,
+    ``compute_lambda_returns``, and ``compute_td_advantage``.
+12. **entropy_sample** — finite, has gradients, differs from raw
+    approximation, non-deterministic across calls.
+13. **Config round-trip** — defaults, serialisation, frozen.
+
+### Full suite: 345 passed (36 new, no regressions).
+
+### Checkpoint (all satisfied)
+
+- [x] Distribution samples and deterministic actions respect CarRacing bounds.
+- [x] λ-returns match hand-calculated trajectories including termination.
+- [x] Critic overfits known synthetic returns.
+- [x] Positive and negative advantages move action likelihood in the correct
   direction.
-- Actor and Critic optimize without changing world-model parameters.
+- [x] Actor and Critic optimise without changing world-model parameters.
 
-### Blocker
+### Blocker resolved
 
-Do not enable upstream behavior gradients until policy and value learning are
-correct with stable inputs.
+Mechanical calibration is complete.  Policy and value learning are verified
+with correct inputs.  Stage 5 (frozen-imagination training) can proceed.
 
-## Stage 5 — Train Actor-Critic in Imagination
+## Stage 5 — Train Actor-Critic in Imagination (Frozen Model) (COMPLETE — implementation, validation pending long training)
 
-### Implementation
+### New files
 
-- Generate short differentiable imagined trajectories.
-- Start with DreamerV3-style return normalization, entropy regularization,
-  gradient clipping, and a slow Critic target.
-- Make the actor-gradient estimator explicit: dynamics gradients,
-  likelihood-ratio gradients, or a documented mixture.
-- Train with the world model frozen first.
+- ``src/rwm/trainers/imagined_actor_critic.py`` — ``ImaginedACTrainer`` loop
+- ``scripts/train_imagined_actor_critic.py`` — thin CLI with ``--smoke``
+- ``tests/unit/test_imagined_actor_critic.py`` — 20 tests
 
-### Checkpoint
+### Training architecture
 
-- Predicted return improves across multiple seeds.
-- Actor entropy does not collapse immediately.
-- Critic error remains bounded as the policy changes.
-- Short real-environment evaluations improve with predicted return.
+::
 
-### Blocker
+    batch → warmup (4 frames) → z_0
+    for h in 0…H-1:
+        c_h = ControllerTrunk.encode(z_h).detach()
+        dist = Actor(c_h)
+        a_h = dist.rsample()
+        r_h = RewardHead(z_h, a_h)          # frozen, no_grad
+        z_{h+1} = advance(z_h, a_h)         # blind, frozen
+    V_h = Critic(c_h)                       # online
+    target_V_h = TargetCritic(c_h)          # target (Polyak)
+    bootstrap = TargetCritic(encode(z_H))   # final next-state value
+    λ-returns, TD advantages → ActorCritic.optimizer_step
 
-If imagined reward rises while real reward falls, treat this as reward-model
-exploitation and return to Stage 2 or shorten the imagination horizon.
+### Termination / continuation contract (imagined rollouts)
+
+``terminated`` is always ``False`` and ``continuation`` is always ``True``
+for every imagined step, including the last.  The ``bootstrap_value``
+comes from the target Critic evaluated on the final imagined state ``z_H``.
+
+### Key design decisions
+
+- **Frozen world model**: ``model.eval()``, ``requires_grad_(False)`` on all
+  parameters.  Verified via hash parity before/after training.
+- **Imagination horizon**: configurable in ``[1, 12]``; default ``H=4``.
+  Initial training must sample only short horizons ``{1, 2, 4}``; ``H=8``
+  requires a separate stability gate and ``H=12`` is initially stress-only.
+- **Warmup**: 4 observed frames from dataset windows, using the correct
+  ``prev_actions`` / ``current_actions`` timing contract.
+- **Actor objective**: score-function policy gradient with ``entropy_sample()``.
+  Actions detached for the log-prob to avoid dual-path gradients through the
+  same Actor parameters.
+- **Critic objective**: MSE against λ-returns using the Stage-4 contract.
+- **Target Critic**: Polyak update after each critic step.
+- **Persistence**: metrics CSV, JSON config, structured AC checkpoint,
+  anchor provenance file.
+
+### Tests (20 tests, all pass)
+
+1. **Action timing** — action scored = action advanced; actions not from
+   future observations.
+2. **No future observation** — imagined tokens have zero spatial component.
+3. **Horizon validation** — ``H ≤ 12``; ``H > 12`` and ``warmup < 1`` raise.
+4. **Final bootstrap** — target Critic on ``z_H`` produces correct value.
+5. **Params change** — Actor and Critic weights change after 3 steps.
+6. **Frozen WM** — all world-model params bitwise identical after 5 steps;
+   ``requires_grad`` all False.
+7. **Action bounds** — all actions satisfy ``[-1, 1]`` / ``[0, 1]``.
+8. **Finite gradients** — losses and grads finite; target Critic changes.
+9. **Reproducibility** — same seed + model gives identical first-step metrics.
+10. **Checkpoint round-trip** — save/restore AC state dict; anchor info and
+    metrics CSV written.
+
+### Smoke gate output (B=2, H=4, 10 steps, seed42 masked anchor)
+
+::
+
+    [    1] actor_loss=-0.0117 | critic_loss=0.0165 | entropy=0.2288 | value_mean=0.0720 | imagined_reward_mean=-0.0536 | action_mean=0.3419 | action_std=0.3444  |  0.7s
+    [    2] actor_loss=-0.0114 | critic_loss=0.0410 | entropy=0.3183 | value_mean=0.0765 | imagined_reward_mean=0.0429 | action_mean=0.3241 | action_std=0.4322  |  0.8s
+    [    3] actor_loss=0.0833  | critic_loss=0.2703 | entropy=0.7354 | value_mean=0.0863 | imagined_reward_mean=0.2140 | action_mean=0.2256 | action_std=0.4333  |  0.8s
+    [    4] actor_loss=-0.0114 | critic_loss=0.2137 | entropy=-0.1469| value_mean=0.0857 | imagined_reward_mean=0.1326 | action_mean=0.1942 | action_std=0.5621  |  0.8s
+    [    5] actor_loss=-0.0048 | critic_loss=0.0200 | entropy=0.6825 | value_mean=0.0654 | imagined_reward_mean=-0.0626 | action_mean=0.4303 | action_std=0.3404  |  0.8s
+    [    6] actor_loss=0.0065  | critic_loss=0.0212 | entropy=0.3361 | value_mean=0.0697 | imagined_reward_mean=-0.0549 | action_mean=0.3027 | action_std=0.5375  |  0.8s
+    [    7] actor_loss=0.0130  | critic_loss=0.0908 | entropy=0.4124 | value_mean=0.0971 | imagined_reward_mean=0.1371 | action_mean=0.3074 | action_std=0.4740  |  0.9s
+    [    8] actor_loss=-0.0098 | critic_loss=0.0224 | entropy=-0.1193| value_mean=0.0608 | imagined_reward_mean=-0.0555 | action_mean=0.4762 | action_std=0.2467  |  0.9s
+    [    9] actor_loss=0.0146  | critic_loss=0.0310 | entropy=0.0416 | value_mean=0.0551 | imagined_reward_mean=-0.0784 | action_mean=0.1792 | action_std=0.5294  |  0.9s
+    [   10] actor_loss=-0.0362 | critic_loss=0.6992 | entropy=-0.1915| value_mean=0.1240 | imagined_reward_mean=0.2940 | action_mean=0.1398 | action_std=0.5694  |  0.9s
+
+**Frozen WM parity**: hash ``240f0dd4d0328400`` identical before and after
+10 training steps.
+
+### Full test suite: 373 passed (20 new, 0 regressions)
+
+### Checkpoint (all satisfied — unit level)
+
+- [x] Short differentiable imagined trajectories generated from observed warmup.
+- [x] Actor gradient uses score-function estimator (likelihood ratio) with
+      detached advantages.
+- [x] Critic trained with λ-returns against target Critic.
+- [x] World model frozen throughout — hash-verified, ``requires_grad``-asserted.
+- [x] Imagined horizon ≤ 12 enforced.
+- [x] Reproducible with fixed seed + mean tokenizer.
+- [x] Structured AC checkpoint round-trip works; anchor provenance recorded.
+
+### Remaining (long training / real evaluation — not yet run)
+
+- Predicted return improvement across seeds and steps.
+- Actor entropy not collapsing.
+- Critic error bounded as policy changes.
+- Real-environment evaluation after sufficient training.
+
+### Current blocker
+
+Long training and environment evaluation have not been run.  The
+implementation is mechanically correct (verified by 20 unit tests + smoke
+gate).  No reward-model exploitation or training instability can be assessed
+without extended runs.
 
 ## Stage 6 — Enable Controlled End-to-End Behavior Gradients
 
@@ -926,11 +1293,22 @@ useful reduced world representation.
 
 ### Implementation order
 
-1. Unfreeze the temporal model at a lower learning rate.
+1. Unfreeze the ControllerTrunk first, then the temporal model at a lower
+   learning rate.
 2. Unfreeze spatial pooling and Top-K scoring/selection.
 3. Unfreeze tokenizer and encoder last.
-4. Continue direct reward updates from real replay throughout.
-5. Measure gradient magnitude and cosine similarity from reward, Actor, and
+4. Every joint update mixes a factual replay batch with imagined trajectories:
+
+   ``L_joint = λ_fact(L_reward_visible + L_reward_masked + βL_KL)
+   + λ_critic L_critic + λ_actor L_actor + λ_entropy L_entropy``.
+
+   The factual reward terms are the anchor to real transitions. Critic targets
+   based only on imagined returns and Actor gradients are useful task pressure,
+   but are not treated as independent grounding signals.
+5. Use separate parameter groups and a lower learning rate for newly unfrozen
+   shared blocks; this is one continuous guarded schedule, not alternating
+   retraining cycles.
+6. Measure gradient magnitude and cosine similarity from reward, Actor, and
    Critic losses at each shared block.
 
 ### Checkpoint after each unfreeze
@@ -940,6 +1318,8 @@ useful reduced world representation.
 - Fixed-probe latent drift remains bounded.
 - Attention does not collapse to identical locations.
 - Actor/Critic gains persist on unseen CarRacing seeds.
+- Held-out visible and masked factual reward probes remain within their
+  declared tolerances while imagined return improves.
 
 ### Blocker
 

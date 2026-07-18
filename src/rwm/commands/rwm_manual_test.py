@@ -25,12 +25,21 @@ def preprocess_obs(obs: np.ndarray, device: torch.device) -> torch.Tensor:
     return torch.from_numpy(array).permute(2, 0, 1).unsqueeze(0).to(device)
 
 
-def load_model(checkpoint_path: Path, device: torch.device) -> ReducedWorldModel:
+def load_model(checkpoint_path: Path, device: torch.device,
+               tokenizer_eval_mode: Optional[str] = None) -> ReducedWorldModel:
     """Load a structured Stage-2 checkpoint, respecting the saved
-    reward-head architecture (linear or nonlinear)."""
+    reward-head architecture (linear or nonlinear).
+
+    Parameters
+    ----------
+    tokenizer_eval_mode:
+        Optional override for the tokenizer evaluation policy (``"sample"`` or ``"mean"``).
+        If ``None``, the checkpoint-saved policy is used.
+    """
     from rwm.utils.checkpointing import load_checkpoint, model_from_checkpoint
     ckpt = load_checkpoint(checkpoint_path, map_location=str(device))
-    model = model_from_checkpoint(ckpt, action_dim=ACTION_DIM)
+    model = model_from_checkpoint(ckpt, action_dim=ACTION_DIM,
+                                  tokenizer_eval_mode_override=tokenizer_eval_mode)
     return model.to(device).eval()
 
 
@@ -48,6 +57,9 @@ def run(
     log_path: Path = typer.Option(Path("runs/manual_reward_eval.csv"), help="CSV output path"),
     fps: int = typer.Option(60, min=1, help="Maximum interactive loop rate"),
     max_steps: Optional[int] = typer.Option(None, min=1, help="Stop after this many total steps"),
+    tokenizer_eval_mode: Optional[str] = typer.Option(
+        None, help="Override tokenizer eval policy: sample or mean (default: checkpoint policy)",
+    ),
 ) -> None:
     """Drive CarRacing and plot predicted versus immediate real reward live.
 
@@ -59,7 +71,7 @@ def run(
     import pygame
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = load_model(ckpt, device)
+    model = load_model(ckpt, device, tokenizer_eval_mode=tokenizer_eval_mode)
     env = gym.make(env_name, render_mode="human", continuous=True)
     # CarRacing creates its SDL video context lazily on reset.  Do this before
     # the keyboard policy touches pygame's event queue.

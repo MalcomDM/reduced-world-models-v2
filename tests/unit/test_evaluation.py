@@ -451,7 +451,7 @@ class TestAttentionTrace:
 
     def test_trace_parity(self):
         """trace_attention must not alter model evaluation outputs."""
-        model = ReducedWorldModel()
+        model = ReducedWorldModel(tokenizer_eval_mode="mean")
         model.eval()
         img = torch.randn(1, 3, 64, 64)
         act = torch.zeros(1, 3)

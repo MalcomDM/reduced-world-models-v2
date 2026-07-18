@@ -45,9 +45,9 @@ def test_positional_embedding_buffer() -> None:
 
 
 @pytest.mark.models
-def test_tokenization_head_is_deterministic_in_eval_mode() -> None:
-    """Evaluation must not inject VAE sampling noise into reward metrics."""
-    head = TokenizationHead().eval()
+def test_tokenization_head_is_deterministic_in_mean_mode() -> None:
+    """mean eval mode: same input produces identical tokens."""
+    head = TokenizationHead(eval_mode="mean").eval()
     x = torch.rand(2, TKN_IN_CHANNELS, FEATURE_MAP_SIZE, FEATURE_MAP_SIZE)
 
     with torch.no_grad():
@@ -55,3 +55,46 @@ def test_tokenization_head_is_deterministic_in_eval_mode() -> None:
         second, _, _ = head(x)
 
     assert torch.equal(first, second)
+
+
+@pytest.mark.models
+def test_sample_eval_can_vary() -> None:
+    """sample eval mode: same input can produce different tokens."""
+    head = TokenizationHead(eval_mode="sample").eval()
+    x = torch.rand(2, TKN_IN_CHANNELS, FEATURE_MAP_SIZE, FEATURE_MAP_SIZE)
+
+    # Run twice with same seed to confirm same seed -> same result
+    torch.manual_seed(0)
+    with torch.no_grad():
+        a, _, _ = head(x)
+    torch.manual_seed(0)
+    with torch.no_grad():
+        b, _, _ = head(x)
+    assert torch.equal(a, b)
+
+    # Different seeds -> likely different
+    torch.manual_seed(1)
+    with torch.no_grad():
+        c, _, _ = head(x)
+    assert not torch.equal(a, c)
+
+
+@pytest.mark.models
+def test_training_stochastic_regardless_of_eval_mode() -> None:
+    """Training always samples, even when eval_mode='mean'."""
+    head = TokenizationHead(eval_mode="mean").train()
+    x = torch.rand(2, TKN_IN_CHANNELS, FEATURE_MAP_SIZE, FEATURE_MAP_SIZE)
+
+    torch.manual_seed(0)
+    with torch.no_grad():
+        a, _, _ = head(x)
+    torch.manual_seed(0)
+    with torch.no_grad():
+        b, _, _ = head(x)
+    # Training uses sampling; same seed -> same result (reparam trick)
+    assert torch.equal(a, b)
+    # But tokens differ from posterior mean (should not equal mean-only output)
+    head.eval()
+    with torch.no_grad():
+        mean_out, _, _ = head(x)
+    assert not torch.equal(a, mean_out)

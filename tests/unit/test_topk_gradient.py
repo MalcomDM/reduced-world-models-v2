@@ -226,7 +226,7 @@ class TestModelIntegration:
 
     def test_attention_trace_runs_and_preserves_model(self):
         """Attention trace runs and does not change model outputs."""
-        model = ReducedWorldModel()
+        model = ReducedWorldModel(tokenizer_eval_mode="mean")
         model.eval()
 
         img = torch.randn(1, 3, 64, 64)

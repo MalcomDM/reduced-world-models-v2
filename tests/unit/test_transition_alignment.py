@@ -11,6 +11,8 @@ The trainer passes:
   - target = reward[t]
 """
 
+from typing import Optional
+
 import numpy as np
 import pytest
 import torch
@@ -59,13 +61,17 @@ class _ModelSpy(torch.nn.Module):
         prev_actions: torch.Tensor,
         current_actions: torch.Tensor,
         force_keep_input: bool = False,
+        observation_keep: Optional[torch.Tensor] = None,
     ) -> WorldModelOutput:
         for t in range(obs.shape[1]):
             self.records.append({
                 "prev_action": prev_actions[:, t].detach().cpu(),
                 "current_action": current_actions[:, t].detach().cpu(),
             })
-        return self._real.forward_sequence(obs, prev_actions, current_actions, force_keep_input)
+        return self._real.forward_sequence(
+            obs, prev_actions, current_actions, force_keep_input,
+            observation_keep=observation_keep,
+        )
 
 
 # ---------------------------------------------------------------------------

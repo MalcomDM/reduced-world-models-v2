@@ -173,20 +173,34 @@ _VALID_REWARD_HEAD_KINDS = ("linear", "nonlinear")
 def model_from_checkpoint(
     checkpoint: Dict[str, Any],
     action_dim: int = 3,
+    tokenizer_eval_mode_override: Optional[str] = None,
 ) -> "torch.nn.Module":
     """Build a ``ReducedWorldModel`` from checkpoint metadata.
 
     Reads reward-head and selection configuration from the checkpoint's
     ``config``.  Legacy/missing fields default to ``"linear"`` head and
     ``"learned"`` selection with ``k=8``.
+
+    Parameters
+    ----------
+    tokenizer_eval_mode_override:
+        If provided (``"sample"`` or ``"mean"``), overrides the checkpoint's
+        saved tokenizer evaluation policy at runtime.  If ``None``, the
+        checkpoint-saved policy is used.
     """
     from rwm.models.rwm.model import ReducedWorldModel
+
+    if tokenizer_eval_mode_override is not None:
+        assert tokenizer_eval_mode_override in (
+            "sample", "mean",
+        ), f"tokenizer_eval_mode_override must be 'sample' or 'mean', got {tokenizer_eval_mode_override!r}"
 
     kind = "linear"
     hidden = 32
     sel_mode = "learned"
     sel_k = 8
     sel_seed = 0
+    tok_eval_mode = "sample"
 
     cfg = checkpoint.get("config")
     if cfg is not None:
@@ -212,6 +226,11 @@ def model_from_checkpoint(
             sel_mode = getattr(pc, "selection_mode", "learned")
             sel_k = getattr(pc, "k", 8)
             sel_seed = getattr(pc, "selection_seed", 0)
+            tok_eval_mode = getattr(pc, "tokenizer_eval_mode", "sample")
+
+    # Apply override if provided
+    if tokenizer_eval_mode_override is not None:
+        tok_eval_mode = tokenizer_eval_mode_override
 
     if kind not in _VALID_REWARD_HEAD_KINDS:
         raise ValueError(
@@ -231,6 +250,7 @@ def model_from_checkpoint(
         selection_mode=sel_mode,
         selection_k=sel_k,
         selection_seed=sel_seed,
+        tokenizer_eval_mode=tok_eval_mode,
     )
     model.load_state_dict(checkpoint["model_state"])
     return model
