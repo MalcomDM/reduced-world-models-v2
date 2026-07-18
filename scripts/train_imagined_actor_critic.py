@@ -1,8 +1,16 @@
 #!/usr/bin/env python3
-"""Thin CLI for Stage 5.0 frozen-world-model imagined Actor-Critic training.
+"""Thin CLI for Stage 5.x frozen-world-model imagined Actor-Critic training.
 
 Usage::
 
+    # Fixed-horizon training
+    python scripts/train_imagined_actor_critic.py --checkpoint <path> --horizon 4
+
+    # Curriculum training (sample H from {1, 2, 4} per batch)
+    python scripts/train_imagined_actor_critic.py --checkpoint <path> \\
+        --horizons 1 2 4 --seed 42
+
+    # Smoke test
     python scripts/train_imagined_actor_critic.py --checkpoint <path> --smoke
 
 The checkpoint must be a Stage-2.5D.1 masked-trained anchor
@@ -38,9 +46,15 @@ def _file_hash(path: Path) -> str:
     return h.hexdigest()[:16]
 
 
+def _reserve_probe_batch(loader, device):
+    """Grab one batch from the loader for fixed-probe evaluation."""
+    batch = next(iter(loader))
+    return {k: v.to(device, non_blocking=True) for k, v in batch.items()}
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Frozen-world-model imagined Actor-Critic training (Stage 5.0)",
+        description="Frozen-world-model imagined Actor-Critic training",
     )
     parser.add_argument(
         "--checkpoint", type=str, required=True,
@@ -56,7 +70,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--out", type=str, default="",
-        help="Output directory (default: runs/imagined_ac/<timestamp>)",
+        help="Output directory (default: runs/imagined_actor_critic/<name>)",
     )
     parser.add_argument(
         "--batch-size", type=int, default=0,
@@ -64,7 +78,11 @@ def main() -> None:
     )
     parser.add_argument(
         "--horizon", type=int, default=0,
-        help="Override imagination horizon (1-12; default 4)",
+        help="Fixed imagination horizon (1-12; overrides curriculum)",
+    )
+    parser.add_argument(
+        "--horizons", type=int, nargs="+", default=None,
+        help="Curriculum of horizons to sample from per batch (e.g. 1 2 4)",
     )
     parser.add_argument(
         "--max-batches", type=int, default=0,
@@ -73,6 +91,10 @@ def main() -> None:
     parser.add_argument(
         "--cache-dir", type=str, default="",
         help="Explicit frame-cache directory; omitted means uncached loading.",
+    )
+    parser.add_argument(
+        "--seed", type=int, default=None,
+        help="Random seed for reproducibility",
     )
     args = parser.parse_args()
 
@@ -105,16 +127,25 @@ def main() -> None:
         train_cfg.max_batches = 10
         train_cfg.log_every = 1
 
+    if args.horizons is not None:
+        train_cfg.horizons = args.horizons
     if args.horizon > 0:
         train_cfg.imagination_horizon = args.horizon
+        train_cfg.horizons = None  # explicit override disables curriculum
     if args.max_batches > 0:
         train_cfg.max_batches = args.max_batches
     if args.batch_size > 0:
         train_cfg.batch_size = args.batch_size
 
     train_cfg.validate()
-    print(f"  Config: H={train_cfg.imagination_horizon}, "
-          f"B={train_cfg.batch_size}, steps={train_cfg.max_batches}")
+
+    pool_str = (str(train_cfg.active_horizon_pool) if train_cfg.horizons
+                else str(train_cfg.imagination_horizon))
+    print(f"  Config: H={pool_str}, B={train_cfg.batch_size}, "
+          f"steps={train_cfg.max_batches}, seed={args.seed}")
+
+    if args.seed is not None:
+        torch.manual_seed(args.seed)
 
     # ------------------------------------------------------------------
     # Data
@@ -169,6 +200,12 @@ def main() -> None:
     print(f"  Device: {device}")
 
     # ------------------------------------------------------------------
+    # Probe batch (reserved before trainer consumes the loader)
+    # ------------------------------------------------------------------
+    probe_batch = _reserve_probe_batch(loader, device)
+    print(f"  Probe batch reserved (B={probe_batch['obs'].shape[0]})")
+
+    # ------------------------------------------------------------------
     # Trainer
     # ------------------------------------------------------------------
     trainer = ImaginedACTrainer(
@@ -177,14 +214,34 @@ def main() -> None:
         train_cfg=train_cfg,
         device=device,
         out_dir=out_dir,
+        seed=args.seed,
+        probe_batch=probe_batch,
     )
     trainer.set_anchor_info(str(ckpt_path.resolve()), ckpt_hash)
 
     # ------------------------------------------------------------------
-    # Run
+    # Pre-training fixed probe
+    # ------------------------------------------------------------------
+    print("\n--- Pre-training fixed probe ---")
+    pre_probe = trainer.evaluate_fixed_probe(horizons=(1, 2, 4))
+    print(json.dumps(pre_probe, indent=2))
+    with open(out_dir / "fixed_probe_pre.json", "w") as f:
+        json.dump(pre_probe, f, indent=2, sort_keys=True)
+
+    # ------------------------------------------------------------------
+    # Train
     # ------------------------------------------------------------------
     print("\nStarting training...")
     trainer.train()
+
+    # ------------------------------------------------------------------
+    # Post-training fixed probe
+    # ------------------------------------------------------------------
+    print("\n--- Post-training fixed probe ---")
+    post_probe = trainer.evaluate_fixed_probe(horizons=(1, 2, 4))
+    print(json.dumps(post_probe, indent=2))
+    with open(out_dir / "fixed_probe_post.json", "w") as f:
+        json.dump(post_probe, f, indent=2, sort_keys=True)
 
     print(f"\nDone. Output in {out_dir}")
 

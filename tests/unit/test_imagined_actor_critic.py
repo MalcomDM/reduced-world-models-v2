@@ -430,3 +430,230 @@ class TestCheckpointRoundtrip:
         assert csv_path.exists()
         lines = csv_path.read_text().strip().split("\n")
         assert len(lines) == 3  # header + 2 rows
+
+
+# ===================================================================
+# 11. Seeded curriculum reproducibility
+# ===================================================================
+
+class TestCurriculumSeed:
+    @pytest.mark.models
+    def test_seed_gives_reproducible_curriculum(self):
+        torch.manual_seed(42)
+        m = ReducedWorldModel(
+            action_dim=ACTION_DIM, reward_head_kind="linear",
+            tokenizer_eval_mode="mean",
+        )
+        m.eval()
+        for p in m.parameters():
+            p.requires_grad_(False)
+
+        cfg = ImaginedACTrainingConfig(
+            warmup_steps=4, horizons=[1, 2, 4], max_batches=5, log_every=5,
+        )
+        loaders = [
+            DataLoader(_FakeDataset(num=8), batch_size=2, shuffle=False)
+            for _ in range(2)
+        ]
+
+        trainers = []
+        for loader in loaders:
+            tr = ImaginedACTrainer(
+                model=copy.deepcopy(m), train_loader=loader,
+                train_cfg=copy.deepcopy(cfg), seed=42,
+                out_dir=Path(tempfile.mkdtemp()),
+            )
+            trainers.append(tr)
+
+        for tr in trainers:
+            tr.train()
+
+        for r1, r2 in zip(trainers[0]._metrics_log, trainers[1]._metrics_log):
+            assert r1["horizon"] == r2["horizon"], (
+                f"Horizon mismatch: {r1['horizon']} vs {r2['horizon']}"
+            )
+
+
+# ===================================================================
+# 12. Horizon recording in metrics
+# ===================================================================
+
+class TestHorizonRecording:
+    @pytest.mark.models
+    def test_horizon_column_in_metrics(self):
+        torch.manual_seed(0)
+        m = ReducedWorldModel(
+            action_dim=ACTION_DIM, reward_head_kind="linear",
+            tokenizer_eval_mode="mean",
+        )
+        m.eval()
+        for p in m.parameters():
+            p.requires_grad_(False)
+
+        cfg = ImaginedACTrainingConfig(
+            warmup_steps=4, horizons=[1, 2, 4], max_batches=10, log_every=10,
+        )
+        loader = DataLoader(_FakeDataset(num=8), batch_size=2, shuffle=False)
+        tr = ImaginedACTrainer(
+            model=m, train_loader=loader, train_cfg=cfg, seed=0,
+            out_dir=Path(tempfile.mkdtemp()),
+        )
+        tr.train()
+
+        assert len(tr._metrics_log) == 10
+        horizons_used = {r["horizon"] for r in tr._metrics_log}
+        assert len(horizons_used) >= 2
+        assert horizons_used.issubset({1, 2, 4})
+
+    @pytest.mark.models
+    def test_fixed_horizon_records_same(self):
+        torch.manual_seed(0)
+        m = ReducedWorldModel(
+            action_dim=ACTION_DIM, reward_head_kind="linear",
+            tokenizer_eval_mode="mean",
+        )
+        m.eval()
+        for p in m.parameters():
+            p.requires_grad_(False)
+
+        cfg = ImaginedACTrainingConfig(
+            warmup_steps=4, imagination_horizon=7, max_batches=5, log_every=5,
+        )
+        loader = DataLoader(_FakeDataset(num=8), batch_size=2, shuffle=False)
+        tr = ImaginedACTrainer(
+            model=m, train_loader=loader, train_cfg=cfg, seed=0,
+            out_dir=Path(tempfile.mkdtemp()),
+        )
+        tr.train()
+        for r in tr._metrics_log:
+            assert r["horizon"] == 7
+
+
+# ===================================================================
+# 13. Fixed-horizon override disables curriculum
+# ===================================================================
+
+class TestFixedHorizonOverride:
+    def test_explicit_horizon_overrides_curriculum(self):
+        cfg = ImaginedACTrainingConfig(horizons=[1, 2, 4])
+        cfg.imagination_horizon = 8
+        cfg.horizons = None
+        cfg.validate()
+        assert cfg.active_horizon_pool == [8]
+
+        cfg2 = ImaginedACTrainingConfig(horizons=[1, 2, 4])
+        assert cfg2.active_horizon_pool == [1, 2, 4]
+
+
+# ===================================================================
+# 14. Fixed-probe determinism
+# ===================================================================
+
+class TestFixedProbe:
+    @pytest.mark.models
+    def test_fixed_probe_deterministic(self):
+        torch.manual_seed(0)
+        m = ReducedWorldModel(
+            action_dim=ACTION_DIM, reward_head_kind="linear",
+            tokenizer_eval_mode="mean",
+        )
+        m.eval()
+        for p in m.parameters():
+            p.requires_grad_(False)
+
+        loader = DataLoader(_FakeDataset(num=8), batch_size=2, shuffle=False)
+        probe_batch = next(iter(loader))
+
+        cfg = ImaginedACTrainingConfig(
+            warmup_steps=4, imagination_horizon=4, max_batches=2, log_every=5,
+        )
+        tr = ImaginedACTrainer(
+            model=m, train_loader=loader, train_cfg=cfg, seed=0,
+            probe_batch=probe_batch,
+            out_dir=Path(tempfile.mkdtemp()),
+        )
+        p1 = tr.evaluate_fixed_probe()
+        p2 = tr.evaluate_fixed_probe()
+        assert p1["1"]["imagined_return"] == p2["1"]["imagined_return"]
+
+    @pytest.mark.models
+    def test_probe_has_all_keys(self):
+        torch.manual_seed(0)
+        m = ReducedWorldModel(
+            action_dim=ACTION_DIM, reward_head_kind="linear",
+            tokenizer_eval_mode="mean",
+        )
+        m.eval()
+        for p in m.parameters():
+            p.requires_grad_(False)
+
+        loader = DataLoader(_FakeDataset(num=8), batch_size=2, shuffle=False)
+        probe_batch = next(iter(loader))
+
+        cfg = ImaginedACTrainingConfig(
+            warmup_steps=4, imagination_horizon=4, max_batches=1, log_every=5,
+        )
+        tr = ImaginedACTrainer(
+            model=m, train_loader=loader, train_cfg=cfg, seed=0,
+            probe_batch=probe_batch,
+            out_dir=Path(tempfile.mkdtemp()),
+        )
+        result = tr.evaluate_fixed_probe()
+        for H in ("1", "2", "4"):
+            assert H in result
+            d = result[H]
+            for key in ("imagined_return", "value_mean",
+                        "steer_mean", "steer_std", "steer_saturation",
+                        "gas_mean", "gas_std", "gas_saturation",
+                        "brake_mean", "brake_std", "brake_saturation"):
+                assert key in d, f"Missing key {key} in H={H}"
+
+
+# ===================================================================
+# 15. Per-dimension action statistics
+# ===================================================================
+
+class TestPerDimStats:
+    @pytest.mark.models
+    def test_per_dim_stats_in_metrics(self):
+        torch.manual_seed(0)
+        m = ReducedWorldModel(
+            action_dim=ACTION_DIM, reward_head_kind="linear",
+            tokenizer_eval_mode="mean",
+        )
+        m.eval()
+        for p in m.parameters():
+            p.requires_grad_(False)
+
+        cfg = ImaginedACTrainingConfig(
+            warmup_steps=4, imagination_horizon=4, max_batches=3, log_every=5,
+        )
+        loader = DataLoader(_FakeDataset(num=8), batch_size=2, shuffle=False)
+        tr = ImaginedACTrainer(
+            model=m, train_loader=loader, train_cfg=cfg, seed=0,
+            out_dir=Path(tempfile.mkdtemp()),
+        )
+        tr.train()
+        for r in tr._metrics_log:
+            for key in ("steer_mean", "steer_std",
+                        "gas_mean", "gas_std",
+                        "brake_mean", "brake_std"):
+                assert key in r
+                assert isinstance(r[key], float)
+
+
+# ===================================================================
+# 16. Config serialization
+# ===================================================================
+
+class TestConfig:
+    def test_horizons_round_trip(self):
+        cfg = ImaginedACTrainingConfig(horizons=[4, 1, 2])
+        assert cfg.active_horizon_pool == [1, 2, 4]
+        d = cfg.to_dict()
+        cfg2 = ImaginedACTrainingConfig.from_dict(d)
+        assert cfg2.horizons == [1, 2, 4]
+
+    def test_validate_curriculum_out_of_range(self):
+        with pytest.raises(ValueError, match="horizon in curriculum"):
+            ImaginedACTrainingConfig(horizons=[1, 13]).validate()

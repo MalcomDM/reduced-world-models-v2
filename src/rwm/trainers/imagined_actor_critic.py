@@ -1,9 +1,9 @@
-"""Frozen-world-model imagined Actor-Critic training (Stage 5.0).
+"""Frozen-world-model imagined Actor-Critic training (Stage 5.x).
 
 Architecture::
 
     observed warmup (4 frames) → z_t
-    Actor(c_t) → a_t                     (differentiable)
+    Actor(c_t) → a_t                     (differentiable or mode)
     RewardHead(z_t, a_t) → r_hat_{t+1}   (frozen, no_grad)
     advance(z_t, a_t) → z_{t+1}          (frozen, nongradient)
 
@@ -17,7 +17,7 @@ import dataclasses
 import json
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
@@ -37,11 +37,10 @@ from rwm.models.rwm.model import ReducedWorldModel
 
 @dataclasses.dataclass
 class ImaginedACTrainingConfig:
-    """Hyperparameters for Stage 5.0 imagined Actor-Critic training."""
+    """Hyperparameters for imagined Actor-Critic training."""
     warmup_steps: int = 4
-    # Start from the empirically safer short blind horizon.  Longer horizons
-    # are a later curriculum decision, not an implicit default.
     imagination_horizon: int = 4
+    horizons: Optional[List[int]] = None  # curriculum; sampled per batch
     gamma: float = 0.997
     lambda_: float = 0.95
     entropy_coef: float = 1e-3
@@ -53,14 +52,30 @@ class ImaginedACTrainingConfig:
     log_every: int = 10
     checkpoint_every: int = 500
 
+    def __post_init__(self) -> None:
+        if self.horizons is not None:
+            self.horizons = sorted(set(self.horizons))
+
     def validate(self) -> None:
         if not 1 <= self.imagination_horizon <= 12:
             raise ValueError(
                 f"imagination_horizon must be in [1, 12], got "
                 f"{self.imagination_horizon}"
             )
+        if self.horizons is not None:
+            for h in self.horizons:
+                if not 1 <= h <= 12:
+                    raise ValueError(
+                        f"horizon in curriculum must be in [1, 12], got {h}"
+                    )
         if self.warmup_steps < 1:
             raise ValueError("warmup_steps must be >= 1")
+
+    @property
+    def active_horizon_pool(self) -> List[int]:
+        if self.horizons is not None:
+            return self.horizons
+        return [self.imagination_horizon]
 
     def to_dict(self) -> Dict[str, Any]:
         return dataclasses.asdict(self)
@@ -92,6 +107,11 @@ class ImaginedACTrainer:
         Torch device.
     out_dir:
         Directory for checkpoints, logs, and config.
+    seed:
+        Optional global random seed for reproducibility.
+    probe_batch:
+        Optional held-out batch for fixed-probe evaluation.  If provided,
+        used by ``evaluate_fixed_probe()``.
     """
 
     def __init__(
@@ -102,11 +122,16 @@ class ImaginedACTrainer:
         ac_cfg: Optional[_ACConfig] = None,
         device: Optional[torch.device] = None,
         out_dir: Optional[Path] = None,
+        seed: Optional[int] = None,
+        probe_batch: Optional[Dict[str, Tensor]] = None,
     ) -> None:
         if train_cfg is None:
             train_cfg = ImaginedACTrainingConfig()
         train_cfg.validate()
         self.cfg = train_cfg
+
+        if seed is not None:
+            torch.manual_seed(seed)
 
         if device is None:
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -141,6 +166,10 @@ class ImaginedACTrainer:
         self._global_step = 0
         self._metrics_log: List[Dict[str, Any]] = []
         self._anchor_info: Dict[str, Optional[str]] = {"path": None, "hash": None}
+        self._probe_batch = probe_batch
+        self._step_rng = torch.Generator(device="cpu")
+        if seed is not None:
+            self._step_rng.manual_seed(seed + 42)
 
         # Config save.
         self._save_config()
@@ -149,19 +178,21 @@ class ImaginedACTrainer:
     # Warmup helper
     # ------------------------------------------------------------------
 
-    def _prep_warmup(self, batch: Dict[str, Tensor]) -> Tuple[Tensor, Tensor, Tensor]:
+    def _prep_warmup(self, batch: Dict[str, Tensor], ws: Optional[int] = None
+                     ) -> Tuple[Tensor, Tensor, Tensor]:
         """Extract warmup observations from a dataset batch.
 
         Returns ``(obs, prev_actions, current_actions)`` each shaped
-        ``(B, warmup_steps, ...)``.
+        ``(B, ws, ...)``.
         """
+        if ws is None:
+            ws = self.cfg.warmup_steps
         B = batch["obs"].shape[0]
-        ws = self.cfg.warmup_steps
         device = self.device
 
         obs = batch["obs"][:, :ws, :, :, :].to(device, non_blocking=True)
         act = batch["action"][:, :ws, :].to(device, non_blocking=True)
-        pred = batch["predecessor_action"].to(device, non_blocking=True)  # (B, A)
+        pred = batch["predecessor_action"].to(device, non_blocking=True)
 
         prev_actions = torch.zeros(B, ws, ACTION_DIM, device=device)
         prev_actions[:, 0] = pred
@@ -177,21 +208,32 @@ class ImaginedACTrainer:
     def generate_trajectory(
         self,
         warmup_state: "ImaginationState",
+        horizon: Optional[int] = None,
+        deterministic: bool = False,
     ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
-        """Generate an imagined trajectory using the Actor.
+        """Generate an imagined trajectory.
+
+        Parameters
+        ----------
+        warmup_state:
+            Result of a warmup call.
+        horizon:
+            Number of imagined steps (defaults to config).
+        deterministic:
+            If True, use ``mode()`` instead of ``rsample()``.
 
         Returns
         -------
         states:
             ``(B, H, D)`` — beliefs ``z_t`` before each action.
         actions:
-            ``(B, H, A)`` — sampled actions.
+            ``(B, H, A)`` — sampled or deterministic actions.
         rewards:
             ``(B, H)`` — frozen reward-head predictions.
         z_H:
-            ``(B, D)`` — belief after the final advance (used for bootstrap).
+            ``(B, D)`` — belief after the final advance.
         """
-        H = self.cfg.imagination_horizon
+        H = horizon if horizon is not None else self.cfg.imagination_horizon
         device = self.device
         B = warmup_state.current_belief.shape[0]
         D = warmup_state.current_belief.shape[-1]
@@ -207,9 +249,8 @@ class ImaginedACTrainer:
         for h in range(H):
             c_t = self.ac.encode(z_t)
             dist = self.ac.actor(c_t)
-            a_t = dist.rsample()
+            a_t = dist.mode() if deterministic else dist.rsample()
 
-            # Frozen reward head.
             with torch.no_grad():
                 _, r_t = self.model.controller(z_t, a_t)
 
@@ -228,15 +269,23 @@ class ImaginedACTrainer:
     def train_step(self, batch: Dict[str, Tensor]) -> Dict[str, float]:
         """Single training step over one batch.
 
-        1. Warmup from observed frames.
-        2. Generate ``H`` imagined steps via Actor.
-        3. Compute bootstrap value from target Critic.
-        4. Call ``ActorCritic.optimizer_step``.
+        1. Optionally sample horizon from curriculum.
+        2. Warmup from observed frames.
+        3. Generate ``H`` imagined steps via Actor.
+        4. Compute bootstrap value from target Critic.
+        5. Call ``ActorCritic.optimizer_step``.
 
         Returns metrics dict.
         """
         ws = self.cfg.warmup_steps
-        H = self.cfg.imagination_horizon
+        pool = self.cfg.active_horizon_pool
+
+        if len(pool) == 1:
+            H = pool[0]
+        else:
+            idx = torch.randint(len(pool), (), generator=self._step_rng).item()
+            H = pool[idx]
+
         device = self.device
 
         obs, prev_actions, current_actions = self._prep_warmup(batch)
@@ -244,16 +293,17 @@ class ImaginedACTrainer:
             obs, prev_actions, current_actions, force_keep_input=True,
         )
 
-        states, actions_t, rewards_t, z_H = self.generate_trajectory(warmup_state)
+        states, actions_t, rewards_t, z_H = self.generate_trajectory(
+            warmup_state, horizon=H,
+        )
 
-        # Bootstrap value from target Critic on final state.
         with torch.no_grad():
             c_H = self.ac.encode(z_H)
-            bootstrap_value = self.ac.target_critic(c_H).squeeze(-1)  # (B,)
+            bootstrap_value = self.ac.target_critic(c_H).squeeze(-1)
 
-        B = states.shape[0]
-        terminated = torch.zeros(B, H, dtype=torch.bool, device=device)
-        continuation = torch.ones(B, H, dtype=torch.bool, device=device)
+        B_ = states.shape[0]
+        terminated = torch.zeros(B_, H, dtype=torch.bool, device=device)
+        continuation = torch.ones(B_, H, dtype=torch.bool, device=device)
 
         metrics = self.ac.optimizer_step(
             states, actions_t, rewards_t,
@@ -265,11 +315,88 @@ class ImaginedACTrainer:
 
         # Extra tracked values.
         with torch.no_grad():
+            metrics["horizon"] = H
             metrics["imagined_reward_mean"] = rewards_t.mean().item()
-            metrics["action_mean"] = actions_t.mean().item()
-            metrics["action_std"] = actions_t.std().item()
+
+            steer = actions_t[..., 0]
+            gas = actions_t[..., 1]
+            brake = actions_t[..., 2]
+            metrics["steer_mean"] = steer.mean().item()
+            metrics["steer_std"] = steer.std().item()
+            metrics["gas_mean"] = gas.mean().item()
+            metrics["gas_std"] = gas.std().item()
+            metrics["brake_mean"] = brake.mean().item()
+            metrics["brake_std"] = brake.std().item()
 
         return metrics
+
+    # ------------------------------------------------------------------
+    # Fixed-probe evaluation
+    # ------------------------------------------------------------------
+
+    def evaluate_fixed_probe(self, horizons: Sequence[int] = (1, 2, 4)
+                             ) -> Dict[str, Any]:
+        """Deterministic probe using ``mode()`` on a held-out batch.
+
+        Uses ``self._probe_batch`` (set at construction).  This is an offline
+        imagined diagnostic only — it does not involve the real environment.
+
+        Returns a dict keyed by horizon with sub-dicts containing:
+            ``imagined_return``, ``value_mean``,
+            ``steer_mean``, ``steer_std``, ``steer_saturation``,
+            ``gas_mean``, ``gas_std``, ``gas_saturation``,
+            ``brake_mean``, ``brake_std``, ``brake_saturation``.
+        """
+        if self._probe_batch is None:
+            return {"error": "no probe batch available"}
+
+        batch = {k: v.to(self.device, non_blocking=True)
+                 for k, v in self._probe_batch.items()}
+        results: Dict[str, Any] = {}
+
+        for H in horizons:
+            ws = self.cfg.warmup_steps
+            obs, prev_actions, current_actions = self._prep_warmup(batch, ws=ws)
+            warmup_state = self.imag.warmup(
+                obs, prev_actions, current_actions, force_keep_input=True,
+            )
+
+            states, actions_t, rewards_t, z_H = self.generate_trajectory(
+                warmup_state, horizon=H, deterministic=True,
+            )
+
+            c_H = self.ac.encode(z_H)
+            with torch.no_grad():
+                bootstrap_value = self.ac.target_critic(c_H).squeeze(-1)
+
+            imagined_return = rewards_t.sum(dim=-1).mean().item()
+            value_mean = self.ac.critic(
+                self.ac.encode(states.reshape(-1, states.shape[-1]))
+            ).reshape(-1, H).mean().item()
+
+            steer = actions_t[..., 0]
+            gas = actions_t[..., 1]
+            brake = actions_t[..., 2]
+
+            def _sat(x, bound=0.98):
+                return (x.abs() > bound).float().mean().item() if True else \
+                       (x > bound).float().mean().item()
+
+            results[str(H)] = {
+                "imagined_return": imagined_return,
+                "value_mean": value_mean,
+                "steer_mean": steer.mean().item(),
+                "steer_std": steer.std().item(),
+                "steer_saturation": _sat(steer),
+                "gas_mean": gas.mean().item(),
+                "gas_std": gas.std().item(),
+                "gas_saturation": (gas > 0.98).float().mean().item(),
+                "brake_mean": brake.mean().item(),
+                "brake_std": brake.std().item(),
+                "brake_saturation": (brake > 0.98).float().mean().item(),
+            }
+
+        return results
 
     # ------------------------------------------------------------------
     # Main loop
@@ -292,7 +419,6 @@ class ImaginedACTrainer:
         for step in range(1, num_batches + 1):
             self._global_step += 1
 
-            # Fetch batch (restart iterator if exhausted).
             try:
                 batch = next(self._data_iter)
             except StopIteration:
@@ -322,15 +448,14 @@ class ImaginedACTrainer:
     # ------------------------------------------------------------------
 
     def _log_step(self, step: int, m: Dict[str, float], elapsed: float) -> None:
+        H = m.get("horizon", "?")
         items = " | ".join(
             f"{k}={v:.4f}" for k, v in m.items()
-            if k != "step"
+            if k not in ("step", "horizon")
         )
-        print(f"[{step:5d}] {items}  |  {elapsed:.1f}s")
+        print(f"[{step:5d}] H={H} {items}  |  {elapsed:.1f}s")
 
     def _save_config(self) -> None:
-        # ``config.json`` is reserved for the resolved ExperimentConfig when
-        # launched by the CLI.  Keep the Stage-5-specific settings separate.
         cfg_path = self.out_dir / "imagined_ac_config.json"
         with open(cfg_path, "w") as f:
             json.dump(self.cfg.to_dict(), f, indent=2, sort_keys=True)
@@ -371,12 +496,6 @@ class ImaginedACTrainer:
         }, ckpt_path)
 
     def load_actor_critic_checkpoint(self, path: Path) -> int:
-        """Restore Actor/Critic/optimizers from a Stage-5 checkpoint.
-
-        The frozen world-model anchor is intentionally not stored a second
-        time.  Its provenance is validated by the caller against ``anchor``.
-        Returns the restored global step.
-        """
         data = torch.load(path, map_location=self.device, weights_only=False)
         if data.get("kind") != "imagined_actor_critic":
             raise ValueError(f"not an imagined Actor-Critic checkpoint: {path}")
