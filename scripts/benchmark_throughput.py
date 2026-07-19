@@ -3,7 +3,7 @@
 
 Usage:
     python scripts/benchmark_throughput.py \
-        --out runs/component_refinement/benchmarks/baseline.json
+        --out runs/component_refinement/causal_transformer/benchmarks/baseline.json
 
 Runs forward+backward on synthetic data with CUDA sync, reporting:
     windows/sec, frames/sec, ms/step, peak GPU mem, loader time.
@@ -96,7 +96,7 @@ def benchmark(
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--out", type=Path, default=Path("runs/component_refinement/benchmarks/baseline.json"))
+    parser.add_argument("--out", type=Path, default=Path("runs/component_refinement/causal_transformer/benchmarks/baseline.json"))
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--sequence-len", type=int, default=16)
     parser.add_argument("--warmup", type=int, default=5)

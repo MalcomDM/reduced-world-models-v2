@@ -6,7 +6,7 @@ Usage::
     # Evaluate trained checkpoint
     python scripts/evaluate_real_env.py \\
         --checkpoint runs/imagined_actor_critic/stage5_3_train/checkpoints/ac_checkpoint_2000.pt \\
-        --anchor runs/component_refinement/08_masked_reward_anchor/seed42/checkpoint_best.pt \\
+        --anchor runs/component_refinement/causal_transformer/08_masked_reward_anchor/seed42/checkpoint_best.pt \\
         --out runs/imagined_actor_critic/stage5_3_eval
 
     # Zero-action baseline

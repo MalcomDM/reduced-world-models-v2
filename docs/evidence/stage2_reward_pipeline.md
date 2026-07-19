@@ -49,18 +49,18 @@ RewardHead(shared(belief_t), action[t]) → reward[t] (= r_{t+1})
 | **Model/baseline ratio** | **0.825** ✅ | **0.856** ✅ |
 | Epochs / Time | 10 / 461 s | 10 / 536 s |
 | Peak GPU | 0.27 GB | 0.27 GB |
-| Checkpoint | ``runs/component_refinement/00_reward_anchor_pre_kl_fix/seed_42/checkpoint_best.pt`` | ``runs/component_refinement/00_reward_anchor_pre_kl_fix/seed_43/checkpoint_best.pt`` |
+| Checkpoint | ``runs/component_refinement/causal_transformer/00_reward_anchor_pre_kl_fix/seed_42/checkpoint_best.pt`` | ``runs/component_refinement/causal_transformer/00_reward_anchor_pre_kl_fix/seed_43/checkpoint_best.pt`` |
 
 **Command (seed 42):**
 ```bash
 python scripts/evaluate_reward_prediction.py --beta 0.0 --epochs 10 \
-    --out runs/component_refinement/00_reward_anchor_pre_kl_fix/seed_42/reproduction_seed42 --max-val-windows 256 --batch-size 8 --seed 42
+    --out runs/component_refinement/causal_transformer/00_reward_anchor_pre_kl_fix/seed_42/reproduction_seed42 --max-val-windows 256 --batch-size 8 --seed 42
 ```
 
 **Command (seed 43):**
 ```bash
 python scripts/evaluate_reward_prediction.py --beta 0.0 --epochs 10 \
-    --out runs/component_refinement/00_reward_anchor_pre_kl_fix/seed_43 --max-val-windows 256 --batch-size 8 --seed 43
+    --out runs/component_refinement/causal_transformer/00_reward_anchor_pre_kl_fix/seed_43 --max-val-windows 256 --batch-size 8 --seed 43
 ```
 
 ### Retired pre-fix beta=1.0 diagnostic
@@ -78,7 +78,7 @@ reduced incorrectly, so its checkpoint and transient artifacts were removed.
 
 ### Action probe (trained checkpoint)
 
-**Checkpoint:** ``runs/component_refinement/00_reward_anchor_pre_kl_fix/seed_42/checkpoint_best.pt``
+**Checkpoint:** ``runs/component_refinement/causal_transformer/00_reward_anchor_pre_kl_fix/seed_42/checkpoint_best.pt``
 
 | Action | Reward |
 |--------|--------|
@@ -109,7 +109,7 @@ defined in `docs/plans/architecture_validation_plan.md`.
 
 ## Interactive human-driving diagnostic
 
-**Checkpoint:** ``runs/component_refinement/00_reward_anchor_pre_kl_fix/seed_43/checkpoint_best.pt``
+**Checkpoint:** ``runs/component_refinement/causal_transformer/00_reward_anchor_pre_kl_fix/seed_43/checkpoint_best.pt``
 
 The restored ``rwm test-rwm-manually`` command was used to drive one
 CarRacing episode interactively while plotting immediate predicted and real

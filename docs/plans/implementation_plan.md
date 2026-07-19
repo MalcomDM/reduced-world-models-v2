@@ -1,5 +1,8 @@
 # Reduced World Models — Structural Refactor Plan
 
+Training/evaluation accounting follows
+`docs/protocols/training_budget_protocol.md`.
+
 ## Purpose
 
 This document is the engineering plan for moving the current repository from
@@ -9,6 +12,10 @@ in `../technical_definitions.md`.
 The post-Stage-2 theory/evidence audit and matched-ablation protocol are in
 `architecture_validation_plan.md`. That document is the source of truth for
 the Stage 2.5 gates; this file retains the larger implementation sequence.
+
+The alternative SRU temporal lineage and its matched go/no-go gates are in
+`sru_temporal_validation_plan.md`. Stage 6 joint world-model gradients remain
+paused until that temporal-backend decision is complete.
 
 The project is not starting from zero. The legacy LSTM path previously achieved
 acceptable end-to-end reward prediction. The immediate goal is to restore that
@@ -593,9 +600,9 @@ extremely sparse and noisy.  Future training should use either:
 Transient smoke runs are intentionally not retained. Reproducible anchor
 artifacts (configuration, environment, manifest, metrics, structured
 checkpoint, and fixed probe set) are retained under
-``runs/component_refinement/00_reward_anchor_pre_kl_fix/seed_42/`` and
+``runs/component_refinement/causal_transformer/00_reward_anchor_pre_kl_fix/seed_42/`` and
 ``seed_43/``. The convention is recorded in
-``runs/component_refinement/RUN_INDEX.md``.
+``runs/component_refinement/causal_transformer/RUN_INDEX.md``.
 
 ### Stage 2 Status
 
@@ -694,7 +701,7 @@ No predecessor crosses an episode boundary.
 No model inference overhead.
 **B.4 — Corrected reward-prediction anchor experiment (COMPLETE).**
 A matched beta sweep (0.0, 0.01, 0.1 × seeds 42, 43) was run after all B.1–B.3
-fixes.  Results are in ``runs/component_refinement/01_corrected_reward_anchor/``.
+fixes.  Results are in ``runs/component_refinement/causal_transformer/01_corrected_reward_anchor/``.
 
 | Beta | Seed 42 ratio | Seed 43 ratio |
 |------|---------------|---------------|
@@ -766,7 +773,7 @@ from state-dict keys.
 
 **C.1 — Reward-head capacity ablation (COMPLETE).**
 Two-seed comparison (42, 43) of linear vs nonlinear (83→32→1, ReLU) reward
-head at beta=0.1.  Results in ``runs/component_refinement/03_nonlinear_reward_head/``.
+head at beta=0.1.  Results in ``runs/component_refinement/causal_transformer/03_nonlinear_reward_head/``.
 
 | Seed | Head | Best val MSE | Ratio | vs baseline |
 |------|------|-------------|-------|-------------|
@@ -795,7 +802,7 @@ not runtime.
 **Verdict:** Learned adaptive Top-K consistently beats both static controls
 across both seeds.  The learned selector provides better held-out reward
 prediction than fixed patch-position candidates.  All 6 checkpoints pass
-the action probe (4/4).  See ``runs/component_refinement/RUN_INDEX.md`` for
+the action probe (4/4).  See ``runs/component_refinement/causal_transformer/RUN_INDEX.md`` for
 the full table.
 
 **C.2B — K-ablation (COMPLETE).**
@@ -819,7 +826,7 @@ because it gives the best observed ratio while preserving the intended tighter
 spatial-information bottleneck.  The current dense implementation has the same
 dominant CNN/tokenizer/scorer FLOPs for every K; K=8 leaves the strongest path
 to later sparse-inference savings.  See
-``runs/component_refinement/RUN_INDEX.md`` for full details.
+``runs/component_refinement/causal_transformer/RUN_INDEX.md`` for full details.
 
 **C.3 — Tokenizer evaluation policy (COMPLETE).**
 
@@ -833,7 +840,7 @@ to later sparse-inference savings.  See
 **Verdict:** The mean policy is deterministic (bitwise identical across
 inference RNG seeds) and marginally better (lower MSE) than sample for both
 seeds.  Sample variance is low (σ ≤ 0.004 in ratio).  See
-``runs/component_refinement/06_tokenizer_eval_policy/RESULTS.md`` for full
+``runs/component_refinement/causal_transformer/06_tokenizer_eval_policy/RESULTS.md`` for full
 details.  ``mean`` becomes the default for future evaluation experiments.
 
 ### D.0 — Masked factual evaluator (COMPLETE)
@@ -884,7 +891,7 @@ observation-masking evaluator.  It is not imagination training.
 - ``MaskedFactualEvaluator`` returns per-horizon results with finite metrics.
 - Legacy unmasked ``forward_sequence``/``forward`` unchanged.
 
-**Validation results** (see ``runs/component_refinement/07_masked_factual_dynamics/RESULTS.md``):
+**Validation results** (see ``runs/component_refinement/causal_transformer/07_masked_factual_dynamics/RESULTS.md``):
 
 - All masked ratios > 1.0 — expected; these anchors were trained with all
   observations visible.  This is an interface sanity check, not evidence of
@@ -910,7 +917,7 @@ plus CLI import tests.  Full suite: 291 passed.
 
 ### D.1 — Temporal observational-dropout training (COMPLETE)
 
-**Training results** (``runs/component_refinement/08_masked_reward_anchor/``):
+**Training results** (``runs/component_refinement/causal_transformer/08_masked_reward_anchor/``):
 
 | Model | Seed 42 visible ratio | Seed 43 visible ratio |
 |-------|:---------------------:|:---------------------:|
@@ -1370,10 +1377,27 @@ useful reduced world representation.
    based only on imagined returns and Actor gradients are useful task pressure,
    but are not treated as independent grounding signals.
 5. Use separate parameter groups and a lower learning rate for newly unfrozen
-   shared blocks; this is one continuous guarded schedule, not alternating
-   retraining cycles.
+   shared blocks. Cached-latent Actor/Critic consolidation and reconstructed
+   factual joint-gradient integration are distinct bounded phases; never
+   alternate unconstrained full convergence of competing objectives.
 6. Measure gradient magnitude and cosine similarity from reward, Actor, and
    Critic losses at each shared block.
+
+### Behavior-gradient boundary
+
+- Dreamer-style imagined Actor/Critic learning differentiates through a fixed
+  dynamics computation but does not use behavior losses to update world-model
+  parameters.
+- This thesis tests a different, explicitly gated hypothesis: value and policy
+  pressure may make the reduced representation easier to control. Start with
+  Critic/value pressure on reconstructed factual windows, then ControllerTrunk
+  and temporal blocks; Actor pressure reaches shared blocks only after factual
+  reward/masked/KL anchors remain stable.
+- Cached `z_t` replay trains only modules above the detached cache boundary.
+  Any experiment claiming Actor/Critic shaping of the world model must
+  reconstruct the selected factual window in the current computation graph.
+- Compare this hypothesis against the frozen boundary rather than treating
+  direct behavior gradients as an assumed improvement.
 
 ### Checkpoint after each unfreeze
 
@@ -1409,6 +1433,72 @@ collect real experience with current policy
 - Add priority using a mixture of random coverage, TD error, reward extremes,
   novelty, and rarity only when uniform replay exposes a measured limitation.
 - Do not restore exact latent hashes as the main memory lookup.
+
+### Optional latent-anchor replay (gated experiment, not a Stage-7 dependency)
+
+The human-memory analogy motivates retaining *where* useful or surprising
+experience occurred, but it must not turn stale model activations into training
+truth.  A memory entry should therefore first be immutable factual metadata:
+episode/timestep, policy and world-model version, immediate reward,
+discounted future return, termination, and optional novelty or TD-error score.
+
+- In a **frozen-world-model** experiment, a cache may additionally store the
+  compact `ImaginationState` needed to resume a dream rollout: causal
+  Transformer output `z_t` plus the latent history/length required by the
+  current attention implementation.  `z_t` alone is not yet a recursively
+  sufficient transition state.  The cache is valid only for the exact
+  world-model parameter hash that created it.
+- In **joint end-to-end training**, sample the metadata pointer but reconstruct
+  the state from its factual observations using the current model.  This keeps
+  Actor/Critic gradients connected to the world model and prevents stale
+  latents from biasing learning.
+- Selection must remain stratified: positive-return events alone are not a
+  valid replay distribution.  Preserve ordinary road, curve, off-road and
+  terminal/bad-outcome coverage alongside high-return and surprising events.
+- Test this only after the uniform-replay Stage-7 baseline exists, comparing
+  equal real-transition and imagined-transition budgets.
+
+Use three lifetimes rather than one unbounded memory:
+
+- **working latent cache:** exact current world-model version, replaced after
+  every world-model update;
+- **rolling training anchors:** bounded FIFO/reservoir capacity within each
+  uniform/high-return/low-return/surprise stratum so useful new experience
+  gradually displaces old experience;
+- **factual archive and fixed probes:** immutable raw rollouts/pointers retained
+  only for grounding, rare boundary cases, reproducibility and drift evidence.
+
+#### Candidate wake–dream–integrate cycle
+
+1. **Wake / ground:** collect factual rollouts and update the world model using
+   visible reward, masked reward and KL anchors.
+2. **Materialise memory:** select reproducible rollout pointers and compute
+   local future returns; encode their versioned `ImaginationState` once.
+3. **Dream / consolidate:** freeze the world model and train Actor/Critic
+   cheaply from the cached starts.  The recorded behavior return is a
+   reference threshold, not a maximum and not automatically the current
+   policy's value target.
+4. **Integrate:** reconstruct the selected windows through the current model
+   for a bounded joint-gradient pass, retaining factual losses and lower
+   learning rates on shared world-model blocks.
+5. Any world-model parameter update invalidates the latent cache; regenerate
+   it from the same factual pointers before the next dream phase.
+
+#### Latent-memory validation rules
+
+- Keep separate training anchors and untouched fixed-probe anchors.
+- Record behavior-policy provenance and horizon-specific future return
+  `G_t^H`; past cumulative reward is not a value target.
+- Because the current Critic estimates `V^pi(z_t)`, a return generated by a
+  different behavior policy is a diagnostic or initialization target, not an
+  unbiased target for the evolving Actor policy.
+- If replay sampling is reward-weighted, either apply and report importance
+  correction or state explicitly that the sampling changes the objective.
+- Measure drift on identical factual pointers after each refresh using
+  downstream reward/value/action changes and an alignment-aware latent metric;
+  raw coordinate-wise `z_t` distance alone is insufficient.
+- Imagined return must be checked by deterministic factual branch replay before
+  it is accepted as Actor improvement.
 
 ### Checkpoint
 

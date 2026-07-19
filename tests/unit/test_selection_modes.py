@@ -281,7 +281,7 @@ class TestCheckpointCompat:
         ``model_from_checkpoint()``."""
         from rwm.utils.checkpointing import load_checkpoint, model_from_checkpoint
         from pathlib import Path
-        ckpt_path = Path("runs/component_refinement/02_vectorized_reward_anchor/beta0.1_seed42/checkpoint_best.pt")
+        ckpt_path = Path("runs/component_refinement/causal_transformer/02_vectorized_reward_anchor/beta0.1_seed42/checkpoint_best.pt")
         if not ckpt_path.exists():
             pytest.skip("Stage-02 checkpoint not found")
         ckpt = load_checkpoint(ckpt_path)

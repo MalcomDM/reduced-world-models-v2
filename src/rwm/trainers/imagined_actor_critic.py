@@ -48,6 +48,7 @@ class ImaginedACTrainingConfig:
     critic_lr: float = 3e-4
     hidden_dim: int = 64
     target_update_rate: float = 0.01
+    batch_size: int = 8
     max_batches: int = 10000
     log_every: int = 10
     checkpoint_every: int = 500
@@ -70,6 +71,8 @@ class ImaginedACTrainingConfig:
                     )
         if self.warmup_steps < 1:
             raise ValueError("warmup_steps must be >= 1")
+        if self.batch_size < 1:
+            raise ValueError("batch_size must be >= 1")
 
     @property
     def active_horizon_pool(self) -> List[int]:
@@ -316,6 +319,7 @@ class ImaginedACTrainer:
         # Extra tracked values.
         with torch.no_grad():
             metrics["horizon"] = H
+            metrics["batch_size"] = B_
             metrics["imagined_reward_mean"] = rewards_t.mean().item()
 
             # Sampled action statistics.
@@ -477,6 +481,7 @@ class ImaginedACTrainer:
 
         self._save_checkpoint(num_batches)
         self._write_metrics_csv()
+        self._write_training_summary(time.time() - start_time)
         if not (self.out_dir / "anchor_checkpoint.txt").exists():
             self._save_anchor_info()
 
@@ -506,6 +511,31 @@ class ImaginedACTrainer:
             f.write(",".join(keys) + "\n")
             for row in self._metrics_log:
                 f.write(",".join(str(row.get(k, "")) for k in keys) + "\n")
+
+    def _write_training_summary(self, elapsed_s: float) -> None:
+        """Persist the optimisation budget without conflating it with data."""
+        horizon_counts: Dict[str, int] = {}
+        imagined_transitions = 0
+        warmup_transitions = 0
+        for row in self._metrics_log:
+            horizon = int(row["horizon"])
+            batch_size = int(row["batch_size"])
+            horizon_counts[str(horizon)] = horizon_counts.get(str(horizon), 0) + 1
+            imagined_transitions += horizon * batch_size
+            warmup_transitions += self.cfg.warmup_steps * batch_size
+
+        peak_gpu_gb: Optional[float] = None
+        if self.device.type == "cuda":
+            peak_gpu_gb = torch.cuda.max_memory_allocated(self.device) / 1e9
+        with open(self.out_dir / "training_summary.json", "w") as f:
+            json.dump({
+                "actor_critic_updates": len(self._metrics_log),
+                "horizon_update_counts": horizon_counts,
+                "imagined_transitions": imagined_transitions,
+                "factual_warmup_transitions_reused": warmup_transitions,
+                "elapsed_s": elapsed_s,
+                "peak_gpu_gb": peak_gpu_gb,
+            }, f, indent=2, sort_keys=True)
 
     def _save_checkpoint(self, step: int) -> None:
         checkpoint_dir = self.out_dir / "checkpoints"

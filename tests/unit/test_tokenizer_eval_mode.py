@@ -167,7 +167,7 @@ class TestCheckpointRoundtrip:
 class TestLegacyAnchorCompat:
     @pytest.fixture
     def stage02_path(self):
-        p = Path("runs/component_refinement/02_vectorized_reward_anchor/beta0.1_seed42/checkpoint_best.pt")
+        p = Path("runs/component_refinement/causal_transformer/02_vectorized_reward_anchor/beta0.1_seed42/checkpoint_best.pt")
         if not p.exists():
             pytest.skip("Stage-02 anchor checkpoint not available")
         return p

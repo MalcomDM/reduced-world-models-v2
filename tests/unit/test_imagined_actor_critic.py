@@ -430,6 +430,10 @@ class TestCheckpointRoundtrip:
         assert csv_path.exists()
         lines = csv_path.read_text().strip().split("\n")
         assert len(lines) == 3  # header + 2 rows
+        summary = json.loads((out_dir / "training_summary.json").read_text())
+        assert summary["actor_critic_updates"] == 2
+        assert summary["imagined_transitions"] == 2 * 4 * 2
+        assert summary["factual_warmup_transitions_reused"] == 2 * 4 * 2
 
 
 # ===================================================================

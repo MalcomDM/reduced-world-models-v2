@@ -418,10 +418,27 @@ Measured quick wins that preserve the research structure are:
   slower.
 
 A standard causal mask prevents future information leakage but does not reduce
-training FLOPs. The current incremental path also recomputes the full temporal
-window; inference acceleration would require cached keys/values or a recurrent
-state. With `T <= 20`, this is not currently the dominant cost and should remain
-deferred until profiling justifies it.
+training FLOPs. The current incremental path has no recurrent or key/value
+state: it appends a 35-D token, retains at most 20 tokens, and recomputes the
+whole temporal window. At `T=20` this is approximately 1.14M temporal MACs,
+versus approximately 46k for one comparable LSTM update. A local batch-1 CUDA
+measurement found about 0.93 ms for the temporal Transformer and 2.10 ms for
+the complete visible incremental model. The bounded context therefore remains
+practical for real-time visible driving, but repeated temporal computation is
+material during blind imagination where no CNN cost hides it.
+
+Before changing temporal architecture:
+
+- remove the duplicate Transformer call in `ImaginationRollout.warmup()`;
+- profile visible inference and multi-horizon blind rollouts separately;
+- retain LSTM/GRU as a measured recurrent baseline;
+- treat key/value caching as a later optimization, noting that the current
+  rolling learned absolute positions prevent naive cache truncation.
+
+The present `z_t` is a context-derived dynamic representation, not yet a
+recursively sufficient state: blind advance consumes the retained 35-D token
+history, not `z_t`. Test `z_t`-only continuation as a separate architectural
+hypothesis rather than assuming observational dropout proves it.
 
 ## Primary Theoretical References
 

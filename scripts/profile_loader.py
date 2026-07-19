@@ -211,7 +211,7 @@ def main():
                         help="Path to frame cache. Default: no cache.")
     parser.add_argument("--no-cache", action="store_true",
                         help="Explicitly disable cache (overrides --cache-dir).")
-    parser.add_argument("--out", type=Path, default=Path("runs/component_refinement/benchmarks/loader_profile.json"))
+    parser.add_argument("--out", type=Path, default=Path("runs/component_refinement/causal_transformer/benchmarks/loader_profile.json"))
     args = parser.parse_args()
 
     cache_dir = None if args.no_cache else args.cache_dir

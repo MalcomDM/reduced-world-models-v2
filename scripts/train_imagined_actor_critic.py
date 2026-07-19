@@ -14,7 +14,7 @@ Usage::
     python scripts/train_imagined_actor_critic.py --checkpoint <path> --smoke
 
 The checkpoint must be a Stage-2.5D.1 masked-trained anchor
-(e.g. ``runs/component_refinement/08_masked_reward_anchor/seed42/checkpoint_best.pt``).
+(e.g. ``runs/component_refinement/causal_transformer/08_masked_reward_anchor/seed42/checkpoint_best.pt``).
 """
 
 from __future__ import annotations

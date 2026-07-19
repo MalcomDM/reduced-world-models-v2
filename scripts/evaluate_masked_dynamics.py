@@ -9,9 +9,9 @@ contribution of previous-action context.
 Usage::
 
     python scripts/evaluate_masked_dynamics.py \\
-        --checkpoint runs/component_refinement/05_k_ablation/learned_k8_seed42/checkpoint_best.pt \\
+        --checkpoint runs/component_refinement/causal_transformer/05_k_ablation/learned_k8_seed42/checkpoint_best.pt \\
         --data-split-seed 42 --cache-dir data/cache/rollout_frames_v1 \\
-        --out runs/component_refinement/07_masked_factual_dynamics/seed42.json
+        --out runs/component_refinement/causal_transformer/07_masked_factual_dynamics/seed42.json
 """
 
 from __future__ import annotations
