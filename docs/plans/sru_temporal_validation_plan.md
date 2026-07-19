@@ -14,9 +14,15 @@ and locked evaluation seeds remain fixed.
 Historical baseline: `runs/component_refinement/causal_transformer/`.
 New artifacts: `runs/component_refinement/sru_temporal/`.
 
+Frozen code baseline:
+
+- branch: `baseline/causal-transformer-stage5`
+- commit: `a0406262c6b3b2db647a7675e4bd6125e157b16f`
+- verification: `pytest` — 416 passed
+
 ## Development Strategy
 
-- First commit the current causal-transformer state and preserve it on
+- The verified causal-transformer state is preserved on
   `baseline/causal-transformer-stage5`.
 - Continue development on `main`.
 - Temporarily support `causal_transformer` and `sru` behind one temporal-model
