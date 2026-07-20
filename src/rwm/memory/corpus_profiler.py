@@ -2,13 +2,14 @@
 
 Read-only profiler over eligible training-file transitions.
 Produces per-pointer metrics, corpus diagnostics, and a sensitivity grid
-for continuous priority weights. Does not create or modify any model,
-trainer, cache, or sampler.
+for continuous priority weights.  Core formula primitives are imported
+from ``priority.py`` to guarantee exact numerical parity.
+
+Does not create or modify any model, trainer, cache, or sampler.
 """
 
 from __future__ import annotations
 
-import hashlib
 import json
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
@@ -17,6 +18,25 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 import numpy as np
 
 from rwm.data.split import collect_and_split
+from rwm.memory.priority import (
+    QUANTIZE_DECIMALS,
+    EPSILON,
+    DEFAULT_SELECTED_H,
+    DEFAULT_CROWDING_RHO,
+    quantize,
+    file_hash,
+    compute_factual_returns,
+    compute_directional_change,
+    percentile_rank,
+    positive_tail_percentile,
+    negative_tail_percentile,
+    compute_priority_score,
+    apply_equal_return_crowding as _priority_crowding,
+    compute_probabilities,
+    effective_sample_size,
+    reservoir_sample,
+    _stable_uniforms,
+)
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -24,164 +44,36 @@ from rwm.data.split import collect_and_split
 
 DEFAULT_HORIZONS: Tuple[int, ...] = (1, 2, 4, 8, 12)
 DEFAULT_D_HORIZONS: Tuple[int, ...] = (2, 3, 4)
-EPSILON: float = 1e-8  # small constant for percentile rank stability
+DEFAULT_SELECTED_D_H: int = 4
+
+ACTIVE_SET_M_CANDIDATES: Tuple[int, ...] = (512, 1024, 2048)
+N_CYCLE_SEEDS: int = 100
+CROWDING_RHO_CANDIDATES: Tuple[float, ...] = (0.0, 0.25, 0.5, 1.0)
 
 # Sensitivity grid — interpretable candidate configurations
-# Each entry: (name, eta, lambda_pos, lambda_neg, lambda_up, lambda_down, lambda_term, alpha, beta)
+# Each entry: (name, eta, lambda_pos, lambda_neg, lambda_up, lambda_down,
+#              lambda_legacy_done, alpha, beta)
 SENSITIVITY_GRID: List[Tuple[str, float, float, float, float, float, float, float, float]] = [
     ("uniform",         1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0),
     ("return_only",     0.1, 1.0, 1.0, 0.0, 0.0, 0.0, 1.0, 1.0),
     ("return_sharp",    0.1, 2.0, 2.0, 0.0, 0.0, 0.0, 2.0, 1.0),
-    ("change_focused",  0.1, 0.5, 0.5, 2.0, 2.0, 1.0, 1.0, 2.0),
-    ("balanced",        0.1, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0),
-    ("high_floor",      0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 1.0, 1.0),
-    ("return_extreme",  0.1, 2.0, 2.0, 0.5, 0.5, 1.0, 2.0, 1.5),
-]
-
-WEIGHT_LABELS = [
-    "eta", "lambda_pos", "lambda_neg", "lambda_up",
-    "lambda_down", "lambda_term", "alpha", "beta",
+    ("change_focused",  0.1, 0.5, 0.5, 2.0, 2.0, 0.0, 1.0, 2.0),
+    ("balanced",        0.1, 1.0, 1.0, 1.0, 1.0, 0.0, 1.0, 1.0),
+    ("high_floor",      0.5, 0.5, 0.5, 0.5, 0.5, 0.0, 1.0, 1.0),
+    ("return_extreme",  0.1, 2.0, 2.0, 0.5, 0.5, 0.0, 2.0, 1.5),
 ]
 
 # ---------------------------------------------------------------------------
-# File hashing
+# Compatibility wrappers — delegate to priority.py
 # ---------------------------------------------------------------------------
 
+# Re-export all formula primitives from priority.py so that existing
+# profiler callers and tests continue to work unchanged.
 
-def file_hash(path: Path) -> str:
-    """SHA-256 hex digest of file contents."""
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(65536), b""):
-            h.update(chunk)
-    return h.hexdigest()
-
-
-# ---------------------------------------------------------------------------
-# Per-pointer metric computations (operate on single file arrays)
-# ---------------------------------------------------------------------------
-
-
-def compute_factual_returns(
-    rewards: np.ndarray,
-    done: np.ndarray,
-    horizon: int,
-) -> np.ndarray:
-    """Undiscounted factual return for every valid pointer.
-
-    ``return[t] = sum(rewards[t : t+horizon])`` when the full window is
-    within the episode and no ``done`` flag is raised inside the window.
-    Invalid pointers (near episode end or across a done boundary) receive
-    ``NaN``.
-
-    For horizon 1 the window is ``[t, t+1)`` — always valid if ``t < T``.
-    """
-    T = len(rewards)
-    out = np.full(T, np.nan, dtype=np.float64)
-    if T == 0:
-        return out
-    if horizon < 1:
-        return out
-    max_t = T - horizon
-    for t in range(max_t + 1):
-        window_done = done[t : t + horizon]
-        if horizon == 1 or not window_done.any():
-            out[t] = rewards[t : t + horizon].sum()
-    return out
-
-
-def compute_directional_change(
-    rewards: np.ndarray,
-    done: np.ndarray,
-    h: int,
-) -> np.ndarray:
-    r"""d_t(h) = mean(rewards[t:t+h]) - mean(rewards[t-h:t]).
-
-    Returns ``NaN`` for pointers where the full ``[t-h, t+h)`` window is
-    not entirely within the episode or crosses a done boundary.
-    """
-    T = len(rewards)
-    out = np.full(T, np.nan, dtype=np.float64)
-    if T < 2 * h:
-        return out
-    for t in range(h, T - h + 1):
-        pre = rewards[t - h : t]
-        post = rewards[t : t + h]
-        if not done[t - h : t + h].any():
-            out[t] = post.mean() - pre.mean()
-    return out
-
-
-# ---------------------------------------------------------------------------
-# Percentile rank helpers
-# ---------------------------------------------------------------------------
-
-
-def percentile_rank(values: np.ndarray) -> np.ndarray:
-    """Percentile rank in [0, 1] for each element.
-
-    Ties receive the mean percentile rank of the tied group.
-    NaN values are preserved as NaN.
-    """
-    out = np.full_like(values, np.nan, dtype=np.float64)
-    finite_mask = ~np.isnan(values)
-    if not finite_mask.any():
-        return out
-    valid = values[finite_mask]
-    n = len(valid)
-    if n == 0:
-        return out
-    order = np.argsort(valid)
-    rank = np.empty(n, dtype=np.float64)
-    rank[order] = np.arange(n, dtype=np.float64)
-    tie_start = 0
-    while tie_start < n:
-        tie_end = tie_start
-        while tie_end < n and np.isclose(valid[order[tie_end]], valid[order[tie_start]]):
-            tie_end += 1
-        mean_rank = float(np.mean(rank[order[tie_start:tie_end]]))
-        rank[order[tie_start:tie_end]] = mean_rank
-        tie_start = tie_end
-    pct = rank / (n - 1) if n > 1 else 0.5
-    out[finite_mask] = pct
-    return out
-
-
-def positive_tail_percentile(values: np.ndarray) -> np.ndarray:
-    """Percentile rank among strictly positive values; zero otherwise.
-
-    For v > 0: percentile rank of v among all positive v.
-    For v <= 0: 0.
-    """
-    out = np.zeros_like(values, dtype=np.float64)
-    pos_mask = values > 0
-    if not pos_mask.any():
-        return out
-    pos_vals = values[pos_mask]
-    pct = percentile_rank(pos_vals)
-    out[pos_mask] = pct
-    return out
-
-
-def negative_tail_percentile(values: np.ndarray) -> np.ndarray:
-    """Percentile rank among strictly negative values (by magnitude); zero otherwise.
-
-    For v < 0: percentile rank of -v among all positive -v values.
-    For v >= 0: 0.
-    """
-    out = np.zeros_like(values, dtype=np.float64)
-    neg_mask = values < 0
-    if not neg_mask.any():
-        return out
-    neg_mags = -values[neg_mask]
-    pct = percentile_rank(neg_mags)
-    out[neg_mask] = pct
-    return out
-
-
-# ---------------------------------------------------------------------------
-# Weight / priority computation
-# ---------------------------------------------------------------------------
+# The canonical compute_weights signature differs (it takes an extra
+# factual_returns argument for crowding).  We keep the profiler's
+# grid-oriented signature that does NOT apply crowding internally
+# (crowding is handled separately via apply_equal_return_crowding).
 
 
 def compute_weights(
@@ -189,38 +81,52 @@ def compute_weights(
     q_neg: np.ndarray,
     q_up: np.ndarray,
     q_down: np.ndarray,
-    terminal: np.ndarray,
+    legacy_done: np.ndarray,
     eta: float,
     lambda_pos: float,
     lambda_neg: float,
     lambda_up: float,
     lambda_down: float,
-    lambda_term: float,
+    lambda_legacy_done: float,
     alpha: float,
     beta: float,
     eps: float = 1e-6,
 ) -> np.ndarray:
-    """Continuous priority weight for each pointer.
+    """Delegate to ``priority.compute_probabilities``.
 
-    ``w_i = eta + lp * (eps + q_pos)^alpha + ln * (eps + q_neg)^alpha
-           + lup * (eps + q_up)^beta + ldn * (eps + q_down)^beta
-           + lt * terminal_i``
+    Computes raw priority score (no crowding) then mixes with uniform floor.
     """
-    w = np.full_like(q_pos, eta, dtype=np.float64)
-    w += lambda_pos * np.where(np.isnan(q_pos), 0.0, (eps + q_pos) ** alpha)
-    w += lambda_neg * np.where(np.isnan(q_neg), 0.0, (eps + q_neg) ** alpha)
-    w += lambda_up * np.where(np.isnan(q_up), 0.0, (eps + q_up) ** beta)
-    w += lambda_down * np.where(np.isnan(q_down), 0.0, (eps + q_down) ** beta)
-    w += lambda_term * np.where(np.isnan(terminal), 0.0, terminal)
-    return w
+    score = compute_priority_score(
+        q_pos, q_neg, q_up, q_down, legacy_done,
+        lambda_pos, lambda_neg, lambda_up, lambda_down,
+        lambda_legacy_done, alpha, beta, eps,
+    )
+    return compute_probabilities(score, eta)
 
 
-def effective_sample_size(weights: np.ndarray) -> float:
-    r"""Effective sample size: ESS = (\sum w_i)^2 / \sum w_i^2."""
-    w = weights[~np.isnan(weights)]
-    if len(w) == 0 or w.sum() <= 0:
-        return 0.0
-    return float(w.sum() ** 2 / (w * w).sum())
+def apply_equal_return_crowding(
+    weights: np.ndarray,
+    factual_returns: np.ndarray,
+    eta: float,
+    rho: float,
+) -> np.ndarray:
+    """Delegate to ``priority.apply_equal_return_crowding``.
+
+    Reconstructs the priority component from the mixture ``weights``,
+    applies crowding, and re-mixes with the uniform floor.
+    """
+    n = len(weights)
+    if n == 0:
+        return weights.astype(np.float64, copy=True)
+    floor_per_pointer = eta / n
+    if eta == 1.0:
+        return np.full(n, 1.0 / n, dtype=np.float64)
+    priority = np.maximum(weights - floor_per_pointer, 0.0) / (1.0 - eta)
+    crowded = _priority_crowding(priority, factual_returns, rho)
+    if crowded.sum() <= 0:
+        return np.full(n, 1.0 / n, dtype=np.float64)
+    crowded /= crowded.sum()
+    return floor_per_pointer + (1.0 - eta) * crowded
 
 
 # ---------------------------------------------------------------------------
@@ -233,43 +139,46 @@ def run_sensitivity_grid(
     q_neg: np.ndarray,
     q_up: np.ndarray,
     q_down: np.ndarray,
-    terminal: np.ndarray,
+    legacy_done: np.ndarray,
     n_pointers: int,
+    selected_H: int,
+    selected_h: int,
+    file_names: Optional[List[str]] = None,
+    pointer_ids: Optional[Sequence[str]] = None,
+    q_ret: Optional[np.ndarray] = None,
 ) -> List[Dict[str, Any]]:
     """Evaluate candidate weight configurations.
 
-    Returns list of dicts with name, params, ESS, active-tag composition
-    for candidate active-set sizes M.
+    Returns list of dicts with name, params, ESS, active-set simulation
+    for M in ACTIVE_SET_M_CANDIDATES.
     """
     results = []
-    M_candidates = [max(100, n_pointers // 10), max(500, n_pointers // 4), n_pointers]
-    for name, eta, lp, ln, lup, ldn, lt, alpha, beta in SENSITIVITY_GRID:
+    for name, eta, lp, ln, lup, ldn, ld, alpha, beta in SENSITIVITY_GRID:
         w = compute_weights(
-            q_pos, q_neg, q_up, q_down, terminal,
-            eta, lp, ln, lup, ldn, lt, alpha, beta,
+            q_pos, q_neg, q_up, q_down, legacy_done,
+            eta, lp, ln, lup, ldn, ld, alpha, beta,
         )
         ess = effective_sample_size(w)
         finite_w = w[~np.isnan(w)]
-        composition: Dict[str, Any] = {}
-        for M in M_candidates:
-            effective_M = min(M, len(finite_w))
-            top_idx = np.argsort(finite_w)[-effective_M:]
-            top_w = finite_w[top_idx]
-            top_total = top_w.sum() if top_w.sum() > 0 else 1.0
-            composition[str(M)] = {
-                "mass_fraction": float(top_w.sum() / finite_w.sum()),
-                "n_pointers": int(effective_M),
-                "tag_positive_pct": None,
-                "tag_negative_pct": None,
-                "tag_terminal_pct": None,
-            }
-        finite_q = q_pos[~np.isnan(q_pos)]
-        tag_pos = (finite_q > 0.5).sum()
-        finite_qn = q_neg[~np.isnan(q_neg)]
-        tag_neg = (finite_qn > 0.5).sum()
-        finite_t = terminal[~np.isnan(terminal)]
-        tag_term = finite_t.sum()
-        total_finite = np.sum(~np.isnan(q_pos))
+        n_finite = len(finite_w)
+
+        # Active-set simulation
+        active_sets: Dict[str, Any] = {}
+        for M in ACTIVE_SET_M_CANDIDATES:
+            if (
+                M > n_pointers
+                or q_ret is None
+                or file_names is None
+                or pointer_ids is None
+            ):
+                active_sets[str(M)] = {"skipped": True}
+                continue
+            sim = simulate_active_set(
+                w, M, q_ret, q_pos, q_neg, q_up, q_down,
+                file_names, pointer_ids,
+            )
+            active_sets[str(M)] = sim
+
         results.append({
             "name": name,
             "params": {
@@ -278,18 +187,16 @@ def run_sensitivity_grid(
                 "lambda_neg": ln,
                 "lambda_up": lup,
                 "lambda_down": ldn,
-                "lambda_term": lt,
+                "lambda_legacy_done": ld,
                 "alpha": alpha,
                 "beta": beta,
             },
+            "selected_H": selected_H,
+            "selected_h": selected_h,
             "effective_sample_size": round(ess, 1),
-            "ess_ratio": round(ess / max(1, len(finite_w)), 4),
-            "active_set_composition": composition,
-            "global_tag_pct": {
-                "positive_pos": round(float(tag_pos / max(1, total_finite) * 100), 2),
-                "negative_pos": round(float(tag_neg / max(1, total_finite) * 100), 2),
-                "terminal": round(float(tag_term / max(1, total_finite) * 100), 2),
-            },
+            "ess_ratio": round(ess / max(1, n_finite), 4),
+            "active_set_simulation": active_sets,
+            "uniform_floor_contribution": round(eta, 4),
         })
     return results
 
@@ -331,7 +238,11 @@ def compute_signal_correlations(
             mask = ~(np.isnan(a) | np.isnan(b))
             if mask.sum() < 3:
                 continue
-            r = np.corrcoef(a[mask], b[mask])[0, 1]
+            a_valid = a[mask]
+            b_valid = b[mask]
+            if np.std(a_valid) == 0.0 or np.std(b_valid) == 0.0:
+                continue
+            r = np.corrcoef(a_valid, b_valid)[0, 1]
             if not np.isnan(r):
                 corr[f"{keys[i]}_vs_{keys[j]}"] = round(float(r), 4)
     return corr
@@ -344,7 +255,6 @@ def compute_signal_correlations(
 
 def compute_episode_contributions(
     file_names: List[str],
-    file_hashes_list: List[str],
     q_ret: np.ndarray,
 ) -> Dict[str, Any]:
     """Contribution of each source episode across return quantile ranges.
@@ -378,7 +288,7 @@ def compute_episode_contributions(
 
 
 def compute_tie_frequencies(values: np.ndarray) -> Dict[str, Any]:
-    """Analyze tie frequency in a value array.
+    """Analyze tie frequency in a quantized value array.
 
     Returns count of unique values, number of tied groups >1, and the
     fraction of elements in ties.
@@ -386,7 +296,8 @@ def compute_tie_frequencies(values: np.ndarray) -> Dict[str, Any]:
     finite = values[~np.isnan(values)]
     if len(finite) == 0:
         return {"unique_values": 0, "tied_groups": 0, "fraction_tied": 0.0}
-    unique, counts = np.unique(finite, return_counts=True)
+    q = quantize(finite)
+    unique, counts = np.unique(q, return_counts=True)
     tied_mask = counts > 1
     tied_elements = counts[tied_mask].sum()
     return {
@@ -398,35 +309,87 @@ def compute_tie_frequencies(values: np.ndarray) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Dense-region analysis
+# Dense-region / concentration metrics
 # ---------------------------------------------------------------------------
 
 
-def compute_dense_region_impact(
+def compute_density_metrics(
     weights: np.ndarray,
     q_ret: np.ndarray,
+    file_names: List[str],
 ) -> Dict[str, Any]:
-    """Check whether dense return regions dominate weighted sampling.
+    """Corrected concentration and density metrics.
 
-    Computes what fraction of total weight is held by the top-k% of
-    pointers sorted by return. If a small return window holds most weight,
-    diversity is low.
+    Reports:
+    - highest-weight 10% pointer mass
+    - lowest-return 10% weight share
+    - highest-return 10% weight share
+    - largest quantized equal-return group: pointer share and weight share
+    - weight Gini coefficient
+    - per-episode maximum contribution
     """
     finite = ~(np.isnan(weights) | np.isnan(q_ret))
     w = weights[finite]
     q = q_ret[finite]
-    if len(w) == 0:
+    fn_arr = np.array(file_names)[finite]
+    N = len(w)
+    if N == 0:
         return {}
-    order = np.argsort(q)
-    w_sorted = w[order]
-    q_sorted = q[order]
-    cum_w = np.cumsum(w_sorted) / w_sorted.sum()
-    result: Dict[str, Any] = {}
-    for pct in [10, 25, 50]:
-        idx = int(len(q_sorted) * pct / 100)
-        result[f"top_{pct}pct_weight_fraction"] = round(float(cum_w[idx]), 4)
-    result["gini_weight"] = round(float(_gini(w)), 4)
-    return result
+
+    # Highest-weight 10%
+    order_desc = np.argsort(w)[::-1]
+    n10 = max(1, N // 10)
+    top_w_idx = order_desc[:n10]
+    top_w_mass = float(w[top_w_idx].sum() / w.sum())
+
+    # Lowest-return 10% weight share
+    order_q = np.argsort(q)
+    low_ret_idx = order_q[:n10]
+    low_ret_w_share = float(w[low_ret_idx].sum() / w.sum())
+
+    # Highest-return 10% weight share
+    high_ret_idx = order_q[-n10:]
+    high_ret_w_share = float(w[high_ret_idx].sum() / w.sum())
+
+    # Largest quantized equal-return group
+    qq = quantize(q)
+    unique_vals, counts = np.unique(qq, return_counts=True)
+    largest_group_val = unique_vals[np.argmax(counts)]
+    lg_mask = qq == largest_group_val
+    lg_pointer_share = float(lg_mask.sum() / N)
+    lg_weight_share = float(w[lg_mask].sum() / w.sum())
+
+    # Gini
+    gini = _gini(w)
+
+    # Per-episode max contribution
+    unique_files_list = list(dict.fromkeys(file_names))
+    ep_max: Dict[str, Any] = {}
+    for fname in unique_files_list:
+        ep_mask = fn_arr == fname
+        if ep_mask.sum() == 0:
+            continue
+        ep_max[fname] = {
+            "count": int(ep_mask.sum()),
+            "weight_sum": round(float(w[ep_mask].sum()), 4),
+        }
+    top_ep = sorted(ep_max.items(), key=lambda x: -x[1]["weight_sum"])[:3]
+
+    return {
+        "highest_weight_10pct_mass_fraction": round(top_w_mass, 4),
+        "lowest_return_10pct_weight_share": round(low_ret_w_share, 4),
+        "highest_return_10pct_weight_share": round(high_ret_w_share, 4),
+        "largest_equal_return_group": {
+            "return_value": round(float(largest_group_val), 6),
+            "pointer_share": round(lg_pointer_share, 4),
+            "weight_share": round(lg_weight_share, 4),
+        },
+        "gini_weight": round(gini, 4),
+        "top_3_episodes": [
+            {"file": k, "count": v["count"], "weight_sum": v["weight_sum"]}
+            for k, v in top_ep
+        ],
+    }
 
 
 def _gini(x: np.ndarray) -> float:
@@ -436,15 +399,242 @@ def _gini(x: np.ndarray) -> float:
         return 0.0
     x_sorted = np.sort(x)
     n = len(x)
-    cumsum = np.cumsum(x_sorted)
-    return float((2 * np.arange(1, n + 1) * x_sorted).sum() / (n * x_sorted.sum()) - (n + 1) / n)
+    return float(
+        (2 * np.arange(1, n + 1) * x_sorted).sum() / (n * x_sorted.sum()) - (n + 1) / n
+    )
+
+
+# ---------------------------------------------------------------------------
+# Active-set simulation (profiler-specific)
+# ---------------------------------------------------------------------------
+
+
+def simulate_active_set(
+    weights: np.ndarray,
+    M: int,
+    q_ret: np.ndarray,
+    q_pos: np.ndarray,
+    q_neg: np.ndarray,
+    q_up: np.ndarray,
+    q_down: np.ndarray,
+    file_names: List[str],
+    pointer_ids: Optional[Sequence[str]] = None,
+    n_cycles: int = N_CYCLE_SEEDS,
+) -> Dict[str, Any]:
+    """Simulate weighted reservoir sampling over multiple cycles.
+
+    Returns composition, replacement, inclusion-frequency and concentration
+    metrics.
+    """
+    N = len(weights)
+    if pointer_ids is None:
+        pointer_ids = tuple(str(i) for i in range(N))
+    effective_M = min(M, N)
+    cycles: List[np.ndarray] = []
+    inclusion_count = np.zeros(N, dtype=np.int64)
+    for cycle_idx in range(n_cycles):
+        indices = reservoir_sample(
+            weights, effective_M, cycle_idx, pointer_ids=pointer_ids
+        )
+        cycles.append(indices)
+        inclusion_count[indices] += 1
+
+    inclusion_freq = inclusion_count / n_cycles
+    concentration = float((inclusion_freq**2).sum())
+
+    tag_labels = ["q_pos>0.5", "q_neg>0.5", "q_up>0", "q_down>0", "legacy_done"]
+    tag_arrays = {
+        "q_pos>0.5": (q_pos > 0.5).astype(np.float64),
+        "q_neg>0.5": (q_neg > 0.5).astype(np.float64),
+        "q_up>0": (q_up > 0).astype(np.float64),
+        "q_down>0": (q_down > 0).astype(np.float64),
+        "legacy_done": np.zeros(N, dtype=np.float64),
+    }
+    composition: Dict[str, Any] = {}
+    for label, arr in tag_arrays.items():
+        cycle_means = []
+        for idxs in cycles:
+            cycle_means.append(float(arr[idxs].mean()))
+        comp = np.array(cycle_means)
+        composition[label] = {
+            "mean_pct": round(float(comp.mean() * 100), 2),
+            "std_pct": round(float(comp.std() * 100), 4),
+        }
+
+    q_bins = [(0.0, 0.25), (0.25, 0.5), (0.5, 0.75), (0.75, 1.0)]
+    ret_quantile_comp: Dict[str, Any] = {}
+    for bin_index, (lo, hi) in enumerate(q_bins):
+        label = f"qG_{lo:.0%}_{hi:.0%}"
+        upper = q_ret <= hi if bin_index == len(q_bins) - 1 else q_ret < hi
+        bin_mask = (q_ret >= lo) & upper & ~np.isnan(q_ret)
+        if not bin_mask.any():
+            continue
+        cycle_fracs = []
+        for idxs in cycles:
+            n_in = int(bin_mask[idxs].sum())
+            cycle_fracs.append(n_in / max(1, len(idxs)))
+        frac = np.array(cycle_fracs)
+        ret_quantile_comp[label] = {
+            "mean_pct": round(float(frac.mean() * 100), 2),
+            "std_pct": round(float(frac.std() * 100), 4),
+        }
+    missing_mask = np.isnan(q_ret)
+    missing_fracs = [
+        float(missing_mask[idxs].sum() / max(1, len(idxs))) for idxs in cycles
+    ]
+    ret_quantile_comp["unranked"] = {
+        "mean_pct": round(float(np.mean(missing_fracs) * 100), 2),
+        "std_pct": round(float(np.std(missing_fracs) * 100), 4),
+    }
+
+    unique_files = list(dict.fromkeys(file_names))
+    ep_comp: Dict[str, Any] = {}
+    for fname in unique_files:
+        ep_mask = np.array([fn == fname for fn in file_names])
+        cycle_fracs = []
+        for idxs in cycles:
+            n_ep = int(ep_mask[idxs].sum())
+            cycle_fracs.append(float(n_ep))
+        frac = np.array(cycle_fracs)
+        ep_comp[fname] = {
+            "mean_count": round(float(frac.mean()), 1),
+            "std_count": round(float(frac.std()), 2),
+        }
+
+    replacement_fractions = []
+    jaccard_distances = []
+    for i in range(1, len(cycles)):
+        intersection = np.intersect1d(cycles[i - 1], cycles[i], assume_unique=True)
+        union = np.union1d(cycles[i - 1], cycles[i])
+        jaccard = len(intersection) / max(1, len(union))
+        replacement_fractions.append(1.0 - len(intersection) / effective_M)
+        jaccard_distances.append(1.0 - jaccard)
+    mean_replacement = (
+        float(np.mean(replacement_fractions)) if replacement_fractions else 0.0
+    )
+    std_replacement = (
+        float(np.std(replacement_fractions)) if replacement_fractions else 0.0
+    )
+    mean_jaccard_distance = (
+        float(np.mean(jaccard_distances)) if jaccard_distances else 0.0
+    )
+
+    all_selected = np.unique(np.concatenate(cycles))
+    unique_pct = round(len(all_selected) / N * 100, 2)
+
+    return {
+        "M": effective_M,
+        "n_cycles": n_cycles,
+        "tag_composition": composition,
+        "ret_quantile_composition": ret_quantile_comp,
+        "episode_composition": {
+            sorted(ep_comp.items(), key=lambda x: -x[1]["mean_count"])[0][0]: (
+                ep_comp[sorted(ep_comp.items(), key=lambda x: -x[1]["mean_count"])[0][0]]
+            ),
+            "top_3_episodes": sorted(ep_comp.items(), key=lambda x: -x[1]["mean_count"])[:3],
+        },
+        "mean_replacement_fraction": round(mean_replacement, 4),
+        "std_replacement_fraction": round(std_replacement, 4),
+        "mean_jaccard_distance": round(mean_jaccard_distance, 4),
+        "unique_pointers_pct": unique_pct,
+        "inclusion_concentration": round(float(concentration), 6),
+    }
+
+
+def is_approximately_uniform(
+    weights: np.ndarray,
+    M: int,
+    n_cycles: int = 50,
+    rtol: float = 0.15,
+) -> bool:
+    N = len(weights)
+    effective_M = min(M, N)
+    counts = np.zeros(N, dtype=np.int64)
+    for cycle_idx in range(n_cycles):
+        indices = reservoir_sample(weights, effective_M, cycle_idx)
+        counts[indices] += 1
+    freq = counts / n_cycles
+    expected = effective_M / N
+    if expected <= 0:
+        return True
+    cv = float(freq.std() / expected)
+    return cv < rtol
+
+
+# ---------------------------------------------------------------------------
+# H / h sensitivity runner
+# ---------------------------------------------------------------------------
+
+
+def run_H_sensitivity(
+    ret_arr: Dict[int, np.ndarray],
+    d_up_pct: Dict[int, np.ndarray],
+    d_down_pct: Dict[int, np.ndarray],
+    legacy_done: np.ndarray,
+    n_pointers: int,
+    file_names: List[str],
+    pointer_ids: Sequence[str],
+    d_horizons: Sequence[int],
+    fixed_h: int,
+) -> Dict[str, Any]:
+    """Run sensitivity grid for each return horizon.
+
+    Returns per-H results with the declared selected_h fixed.
+    """
+    if fixed_h not in d_horizons:
+        raise ValueError(f"fixed_h={fixed_h} is not in d_horizons")
+    by_H: Dict[str, Any] = {}
+    for H in sorted(ret_arr.keys()):
+        qG = percentile_rank(ret_arr[H])
+        q_pos = np.maximum(0.0, 2.0 * qG - 1.0)
+        q_neg = np.maximum(0.0, 1.0 - 2.0 * qG)
+        by_H[f"H={H}"] = run_sensitivity_grid(
+            q_pos, q_neg,
+            d_up_pct[fixed_h], d_down_pct[fixed_h],
+            legacy_done, n_pointers,
+            selected_H=H, selected_h=fixed_h,
+            file_names=file_names, pointer_ids=pointer_ids, q_ret=qG,
+        )
+    return by_H
+
+
+def run_h_sensitivity(
+    ret_arr: Dict[int, np.ndarray],
+    d_up_pct: Dict[int, np.ndarray],
+    d_down_pct: Dict[int, np.ndarray],
+    legacy_done: np.ndarray,
+    n_pointers: int,
+    file_names: List[str],
+    pointer_ids: Sequence[str],
+    horizons: Sequence[int],
+    fixed_H: int,
+) -> Dict[str, Any]:
+    """Run sensitivity grid for each d_horizon.
+
+    Returns per-h results with the declared selected_H fixed.
+    """
+    if fixed_H not in horizons:
+        raise ValueError(f"fixed_H={fixed_H} is not in horizons")
+    qG = percentile_rank(ret_arr[fixed_H])
+    q_pos = np.maximum(0.0, 2.0 * qG - 1.0)
+    q_neg = np.maximum(0.0, 1.0 - 2.0 * qG)
+    by_h: Dict[str, Any] = {}
+    for h in sorted(d_up_pct.keys()):
+        by_h[f"h={h}"] = run_sensitivity_grid(
+            q_pos, q_neg,
+            d_up_pct[h], d_down_pct[h],
+            legacy_done, n_pointers,
+            selected_H=fixed_H, selected_h=h,
+            file_names=file_names, pointer_ids=pointer_ids, q_ret=qG,
+        )
+    return by_h
 
 
 # ---------------------------------------------------------------------------
 # Main profiler
 # ---------------------------------------------------------------------------
 
-DEFAULT_SENSITIVITY_CONFIGS = SENSITIVITY_GRID  # alias for import
+DEFAULT_SENSITIVITY_CONFIGS = SENSITIVITY_GRID
 
 
 def profile_corpus(
@@ -452,6 +642,8 @@ def profile_corpus(
     data_split_seed: int,
     horizons: Sequence[int] = DEFAULT_HORIZONS,
     d_horizons: Sequence[int] = DEFAULT_D_HORIZONS,
+    selected_H: Optional[int] = None,
+    selected_h: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Run the full corpus inventory for one split seed.
 
@@ -461,14 +653,14 @@ def profile_corpus(
     - per-h smoothing directional change statistics
     - signal correlations
     - episode contributions by return quantile
-    - dense-region impact analysis
-    - effective sample size and active set composition
+    - corrected density/concentration metrics
+    - effective sample size and active-set simulations
       for each candidate weight configuration
+    - H/h sensitivity across all combinations
     """
     data_root = Path(data_root)
     train_files, val_files = collect_and_split(data_root, data_split_seed)
 
-    # Phase 1: verify disjointness and hash files
     train_set = set(train_files)
     val_set = set(val_files)
     assert train_set.isdisjoint(val_set), "Train/val files overlap"
@@ -481,10 +673,10 @@ def profile_corpus(
     # Phase 2: load every training file and extract per-pointer raw values
     file_names: List[str] = []
     file_hashes_list: List[str] = []
+    pointer_ids: List[str] = []
     timesteps: List[int] = []
     immediate_rewards: List[float] = []
-    terminated_flags: List[bool] = []
-    truncated_flags: List[bool] = []
+    legacy_done_flags: List[bool] = []
     returns: Dict[int, List[Optional[float]]] = {H: [] for H in horizons}
     d_vals: Dict[int, List[Optional[float]]] = {h: [] for h in d_horizons}
     episode_lengths: List[int] = []
@@ -515,10 +707,10 @@ def profile_corpus(
         for t in range(T):
             file_names.append(fpath.name)
             file_hashes_list.append(fhash)
+            pointer_ids.append(f"{fhash}:{t}")
             timesteps.append(t)
             immediate_rewards.append(float(rewards[t]))
-            terminated_flags.append(bool(done_arr[t]))
-            truncated_flags.append(bool(done_arr[t]))  # not stored separately
+            legacy_done_flags.append(bool(done_arr[t]))
             pointer_file_indices.append(fi)
 
     n_pointers = len(file_names)
@@ -540,10 +732,22 @@ def profile_corpus(
         d_up_pct[h] = positive_tail_percentile(arr)
         d_down_pct[h] = negative_tail_percentile(arr)
 
-    q_pos = np.maximum(0.0, 2.0 * ret_pct[max(horizons)] - 1.0)
-    q_neg = np.maximum(0.0, 1.0 - 2.0 * ret_pct[min(horizons)])
+    selected_H = max(horizons) if selected_H is None else selected_H
+    selected_h = max(d_horizons) if selected_h is None else selected_h
+    if selected_H not in horizons:
+        raise ValueError(f"selected_H={selected_H} is not in horizons")
+    if selected_h not in d_horizons:
+        raise ValueError(f"selected_h={selected_h} is not in d_horizons")
 
-    terminal_arr = np.array(terminated_flags, dtype=np.float64)
+    # Use one explicitly selected horizon for consistent q_pos/q_neg.
+    qG_selected = ret_pct[selected_H]
+    q_pos = np.maximum(0.0, 2.0 * qG_selected - 1.0)
+    q_neg = np.maximum(0.0, 1.0 - 2.0 * qG_selected)
+
+    q_up_selected = d_up_pct[selected_h]
+    q_down_selected = d_down_pct[selected_h]
+
+    legacy_done_arr = np.array(legacy_done_flags, dtype=np.float64)
 
     # Phase 4: quantile summaries
     def quantile_summary(arr: np.ndarray) -> Dict[str, float]:
@@ -571,42 +775,90 @@ def profile_corpus(
 
     # Phase 6: episode contribution by return quantile
     episode_contrib = compute_episode_contributions(
-        file_names, file_hashes_list, ret_pct[max(horizons)],
+        file_names, qG_selected,
     )
 
-    # Phase 7: sensitivity grid
-    # Use the median d_horizon for q_up / q_down
-    mid_d_h = d_horizons[len(d_horizons) // 2]
+    # Phase 7: sensitivity grid with active-set simulation
     sensitivity = run_sensitivity_grid(
         q_pos, q_neg,
-        d_up_pct[mid_d_h], d_down_pct[mid_d_h],
-        terminal_arr, n_pointers,
+        q_up_selected, q_down_selected,
+        legacy_done_arr, n_pointers,
+        selected_H=selected_H, selected_h=selected_h,
+        file_names=file_names, pointer_ids=pointer_ids, q_ret=qG_selected,
     )
 
-    # Also run sensitivity for each d_horizon separately
-    sensitivity_by_h: Dict[str, List[Dict[str, Any]]] = {}
-    for h in d_horizons:
-        sensitivity_by_h[f"h={h}"] = run_sensitivity_grid(
-            q_pos, q_neg,
-            d_up_pct[h], d_down_pct[h],
-            terminal_arr, n_pointers,
-        )
+    # Phase 8: H/h sensitivity across all combinations
+    H_sensitivity = run_H_sensitivity(
+        ret_arr, d_up_pct, d_down_pct,
+        legacy_done_arr, n_pointers, file_names, pointer_ids, d_horizons,
+        fixed_h=selected_h,
+    )
+    h_sensitivity = run_h_sensitivity(
+        ret_arr, d_up_pct, d_down_pct,
+        legacy_done_arr, n_pointers, file_names, pointer_ids, horizons,
+        fixed_H=selected_H,
+    )
 
-    # Phase 8: dense-region impact (using balanced config)
-    balanced_w = compute_weights(
+    # Phase 9: equal-return crowding sensitivity on the balanced config.
+    balanced_w_uncorrected = compute_weights(
         q_pos, q_neg,
-        d_up_pct[mid_d_h], d_down_pct[mid_d_h],
-        terminal_arr,
-        0.1, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
+        q_up_selected, q_down_selected,
+        legacy_done_arr,
+        0.1, 1.0, 1.0, 1.0, 1.0, 0.0, 1.0, 1.0,
     )
-    dense_impact = compute_dense_region_impact(balanced_w, ret_pct[max(horizons)])
+    crowding_sensitivity: Dict[str, Any] = {}
+    for rho in CROWDING_RHO_CANDIDATES:
+        corrected_weights = apply_equal_return_crowding(
+            balanced_w_uncorrected,
+            ret_arr[selected_H],
+            eta=0.1,
+            rho=rho,
+        )
+        active_sets = {
+            str(M): simulate_active_set(
+                corrected_weights,
+                M,
+                qG_selected,
+                q_pos,
+                q_neg,
+                q_up_selected,
+                q_down_selected,
+                file_names,
+                pointer_ids,
+            )
+            for M in ACTIVE_SET_M_CANDIDATES
+            if M <= n_pointers
+        }
+        crowding_sensitivity[str(rho)] = {
+            "rho": rho,
+            "effective_sample_size": round(
+                effective_sample_size(corrected_weights), 1
+            ),
+            "ess_ratio": round(
+                effective_sample_size(corrected_weights) / n_pointers, 4
+            ),
+            "density_metrics": compute_density_metrics(
+                corrected_weights, ret_arr[selected_H], file_names
+            ),
+            "active_set_simulation": active_sets,
+        }
 
-    # Phase 9: per-horizon eligibility
+    selected_weights = apply_equal_return_crowding(
+        balanced_w_uncorrected,
+        ret_arr[selected_H],
+        eta=0.1,
+        rho=DEFAULT_CROWDING_RHO,
+    )
+    density_metrics = compute_density_metrics(
+        selected_weights, ret_arr[selected_H], file_names
+    )
+
+    # Phase 10: per-horizon eligibility
     eligible_counts = {}
     for H in horizons:
         eligible_counts[f"H={H}"] = int((~np.isnan(ret_arr[H])).sum())
 
-    # Phase 10: surprise counts per d_horizon
+    # Phase 11: surprise counts per d_horizon
     surprise_counts = {}
     for h in d_horizons:
         n_up = int((d_up_pct[h] > 0).sum())
@@ -618,8 +870,8 @@ def profile_corpus(
             "down_count": n_down, "down_pct": pct_down,
         }
 
-    # Phase 11: final summary
-    corpus_summary = {
+    any_legacy_done = any(legacy_done_flags)
+    corpus_summary: Dict[str, Any] = {
         "seed": data_split_seed,
         "data_root": str(data_root),
         "n_files": len(all_files),
@@ -637,17 +889,24 @@ def profile_corpus(
         "tie_frequencies": tie_frequencies,
         "d_quantiles": d_quantiles,
         "surprise_counts": surprise_counts,
+        "quantize_decimals": QUANTIZE_DECIMALS,
         "signal_correlations": correlations,
         "episode_contributions": episode_contrib,
-        "dense_region_impact": dense_impact,
+        "density_metrics": density_metrics,
+        "crowding_sensitivity": crowding_sensitivity,
+        "selected_crowding_rho": DEFAULT_CROWDING_RHO,
         "sensitivity_grid": sensitivity,
-        "sensitivity_by_d_horizon": sensitivity_by_h,
-        "all_terminated": all(terminated_flags) if len(terminated_flags) > 0 else False,
-        "all_truncated": all(truncated_flags) if len(truncated_flags) > 0 else False,
-        "note_terminated_truncated": (
-            "The rollout schema stores done=terminated|truncated without distinction. "
-            "All done flags are False in the current corpus; all transitions are truncated "
-            "(timed-out) episodes. Terminated/truncated separation requires schema extension."
+        "sensitivity_by_H": H_sensitivity,
+        "sensitivity_by_h": h_sensitivity,
+        "selected_H": selected_H,
+        "selected_h": selected_h,
+        "any_legacy_done": any_legacy_done,
+        "note_episode_end": (
+            "The rollout schema stores done = terminated OR truncated "
+            "without distinction.  Separate terminated/truncated information "
+            "is unavailable for these files.  The field is named 'legacy_done' "
+            "to avoid claiming the terminated/truncated distinction.  "
+            f"legacy_done=True samples: {int(legacy_done_arr.sum())}."
         ),
     }
 

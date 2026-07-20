@@ -7,7 +7,7 @@
 | Thesis direction and terminology | `Summary.md` | Concise research motivation; not an execution checklist. |
 | Architecture, timing, objectives, and gradient boundaries | `technical_definitions.md` | Canonical design contract. |
 | Rollout indexing and schema semantics | `contracts/transition_contract.md` | Canonical data contract; preserves historical bugs as labelled evidence. |
-| Optional latent replay semantics | `contracts/latent_memory_contract.md` | Canonical versioning, invalidation, gradient, sampling, and retention contract. |
+| Factual memory and latent-cache semantics | `contracts/latent_memory_contract.md` | Canonical versioning, invalidation, gradient, sampling, and retention contract. |
 | Research hypotheses, evidence limits, performance audit, and ablations | `plans/architecture_validation_plan.md` | Canonical Stage 2.5 validation plan. |
 | Implementation order and completion history | `plans/implementation_plan.md` | Canonical engineering stage plan. |
 | Temporal-backend decision | `plans/sru_temporal_validation_plan.md` | Completed MinimalSRU S0–S6 validation and adoption record. |
@@ -39,7 +39,7 @@ When two documents appear to conflict, prefer this order:
 | Complete | 5 | Frozen imagined Actor-Critic | Critic learns; real-environment evaluation works. |
 | Complete | SRU S0–S6 | Temporal-backend replacement | MinimalSRU passes reward, blind-dynamics, z-only imagination, and policy-parity gates. |
 | Complete (calibration deferred) | 6 | Safe ControllerTrunk + Critic boundary | Connectivity/predictive gates passed; the 500-update schedule needs gentler calibration after memory. |
-| Active next | 7 | Factual memory, latent cache, and wake–dream replay | Stratified replay beats an equal-budget uniform baseline and establishes a stronger behavioral control. |
+| Active next | 7 | Factual memory, latent cache, and wake–dream replay | Probabilistic priority replay beats an equal-budget uniform baseline and establishes a stronger behavioral control. |
 | Planned | 8 | Memory-informed upstream gradients and cycle calibration | Progressively open SRU/Actor/perception against the stronger Stage-7 baseline, then calibrate repeated cycles. |
 | Planned | 9 | Thesis ablations and interpretation | Each retained component has matched evidence or is labelled unproven. |
 | Planned | 10 | Final thesis evaluation | Multi-seed results under predeclared interaction and compute budgets. |

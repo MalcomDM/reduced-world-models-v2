@@ -228,8 +228,9 @@ weighted sampling without replacement. The complete factual-pointer index
 remains cheap and permanent; old active memories leave naturally when new
 weighted samples are drawn. Reporting tags may describe positive, negative,
 ordinary, change and terminal cases, but they do not impose fixed slice
-budgets. Positive-only replay is permitted only as an explicitly labelled
-overfit diagnostic.
+budgets. A mild equal-return crowding correction reduces redundant priority
+without suppressing the uniform floor. Positive-only replay is
+permitted only as an explicitly labelled overfit diagnostic.
 
 ### 7.2 — Versioned `z_t` Working Cache
 

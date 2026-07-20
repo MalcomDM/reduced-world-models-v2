@@ -78,6 +78,11 @@ Transformer cache would additionally require its bounded history and lengths.
   change. It contributes priority but does not own a fixed-capacity partition.
   Model-error surprise is a separate future signal with a producer-checkpoint
   version.
+- Exact-return redundancy reduces only the non-uniform priority score:
+  `score' = score / count_same_return**rho`. Sampling then mixes
+  `eta/N + (1-eta)*normalized(score')`. The initial `rho=0.25` preserves a
+  fixed total uniform mass while making duplicate priority grow sublinearly;
+  `rho=0.5` is retained as a stronger ablation.
 - Rebuild the bounded active dream set probabilistically each cycle using
   weighted sampling without replacement. New pointers then compete naturally
   with old active memories.

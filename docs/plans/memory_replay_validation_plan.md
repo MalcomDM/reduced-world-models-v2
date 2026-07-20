@@ -98,23 +98,30 @@ q↑ᵢ = positive-tail percentile of dᵢ, else 0    # recovery/improvement
 q↓ᵢ = positive-tail percentile of -dᵢ, else 0   # degradation/failure
 ```
 
-An initial continuous weight may use:
+An initial continuous priority score may use:
 
 ```text
-wᵢ = η
-   + λ₊ (ε + q⁺ᵢ)^α
+sᵢ = λ₊ (ε + q⁺ᵢ)^α
    + λ₋ (ε + q⁻ᵢ)^α
    + λ↑ (ε + q↑ᵢ)^β
    + λ↓ (ε + q↓ᵢ)^β
    + λT terminalᵢ
 ```
 
-`η > 0` is the uniform coverage floor. The separated `q⁺`/`q⁻` terms avoid the
-degenerate `q + (1-q) = 1` case. Coefficients and exponents are declared after
-the corpus audit and frozen before training. Percentiles avoid dependence on
-CarRacing's absolute reward scale. The local window `h` is also frozen by the
-7.0A protocol. It uses a short reward-rate comparison rather than adjacent raw
-rewards, so ordinary sparse reward pulses do not all become “surprises.”
+After crowding correction, normalize the score and mix a fixed total uniform
+mass:
+
+```text
+s'ᵢ = sᵢ / count_same_returnᵢ^ρ
+P(i) = η / N + (1 - η) · s'ᵢ / Σⱼs'ⱼ
+```
+
+`η=0.1` means ten percent of total probability is uniform; it is not an
+additive constant repeated for every pointer. The separated `q⁺`/`q⁻` terms
+avoid the degenerate `q + (1-q) = 1` case. Percentiles avoid dependence on
+CarRacing's absolute reward scale. The local window `h` uses a short
+reward-rate comparison rather than adjacent raw rewards, so ordinary sparse
+reward pulses do not all become “surprises.”
 
 `q↑` and `q↓` are priority signals and reporting tags, not reserved memory
 capacities. They preserve both recovery and failure transitions while allowing
@@ -140,22 +147,25 @@ ordinary, transition and terminal labels remain useful for reports, not for
 hard storage partitions.
 
 This is competition by **factual priority**, not semantic image similarity.
-If the corpus audit shows that one dense return region monopolizes the active
-set, a lightweight one-dimensional crowding correction may be declared:
+The corpus audit found a dominant exact-return group, so Stage 7 uses a
+lightweight equal-return crowding correction:
 
 ```text
-gapᵢ = qGᵢ₊₁ - qGᵢ₋₁
-wᵢ ← wᵢ · (ε + gapᵢ)^ρ
+s'ᵢ = sᵢ / count_same_returnᵢ^ρ
 ```
 
-after sorting by `qG`. Dense neighbors then receive less mass while isolated
-return regions are retained. This uses the already indexed scalar return and
-is not a learned similarity model. It is optional and must be frozen by the
-7.0A protocol before any policy comparison.
+The selected initial value is `ρ=0.25`: duplicate priority grows with the
+three-quarter power of group size instead of linearly. The corpus audit showed
+that `ρ=0.5` over-concentrates probability on rare returns. `ρ={0,0.5,1}`
+remain declared ablations. The uniform mixture `η` remains intact. This uses
+the already indexed, quantized factual return and is not a learned similarity
+model.
 
 ## Stage 7.0 — Measurement and uniform foundation
 
 ### 7.0A — Corpus inventory
+
+Status: **COMPLETE**.
 
 Build a read-only profiler over eligible training files:
 
@@ -170,6 +180,9 @@ Deliver a compact report and proposed coefficients, exponents, uniform floor
 and active-set size. Do not train.
 
 ### 7.0B — Factual pointer index
+
+Status: **COMPLETE**. The post-review integrity pass added immutable public
+access, conflicting-ID rejection and explicit source-hash validation.
 
 Implement the versioned pointer schema, deterministic index builder and
 uniform sampler.
@@ -195,7 +208,7 @@ the same budget, even when its distribution differs.
 
 Implement:
 
-- deterministic percentile/rank calculation with tie handling;
+- deterministic percentile/rank and equal-return crowding calculations;
 - continuous weight calculation and nonzero uniform floor;
 - weighted sampling without replacement;
 - bounded active-set rebuild with deterministic cycle seeds;

@@ -24,6 +24,7 @@ from rwm.memory.corpus_profiler import (
     DEFAULT_HORIZONS,
     DEFAULT_D_HORIZONS,
     SENSITIVITY_GRID,
+    ACTIVE_SET_M_CANDIDATES,
 )
 
 
@@ -73,7 +74,6 @@ def main(argv: list[str] | None = None) -> None:
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    all_summaries: dict[str, dict] = {}
     for seed in args.seeds:
         print(f"Profiling seed {seed}...", file=sys.stderr)
         summary = profile_corpus(
@@ -88,82 +88,98 @@ def main(argv: list[str] | None = None) -> None:
         with open(out_path, "w") as f:
             json.dump(summary, f, indent=2, default=_json_fallback)
         print(f"  Wrote {out_path}", file=sys.stderr)
-        all_summaries[f"seed{seed}"] = summary
 
-    _write_results_md(all_summaries, out_dir, args)
-    _write_run_index(out_dir)
+    _write_results_md_from_disk(out_dir)
     print(f"Done. Results in {out_dir.resolve()}", file=sys.stderr)
 
 
-def _write_results_md(
-    summaries: dict[str, dict],
-    out_dir: Path,
-    args: argparse.Namespace,
-) -> None:
-    """Write a concise RESULTS.md with key numbers from both seeds."""
-    lines = [
+def _write_results_md_from_disk(out_dir: Path) -> None:
+    """Write RESULTS.md from saved JSON summaries."""
+    md_dir = out_dir
+    lines: list[str] = [
         "# 00 Corpus Inventory — RESULTS\n",
-        f"Date: (generated)\n",
-        f"Data root: `{args.data_root}`\n",
-        f"Seeds: {args.seeds}\n",
-        f"Horizons: {args.horizons}\n",
-        f"d-horizons: {args.d_horizons}\n",
+        "Data root: `data/rollouts/rwm_deterministic/scenario_0/`\n",
+        "Seeds: 42, 43\n",
         "---\n",
     ]
-    for seed_label in sorted(summaries.keys()):
-        s = summaries[seed_label]
-        lines.append(f"## {seed_label}\n")
+
+    for seed_label in sorted(md_dir.glob("seed*")):
+        json_path = seed_label / "corpus_summary.json"
+        if not json_path.exists():
+            continue
+        with open(json_path) as f:
+            s = json.load(f)
+
+        lines.append(f"## {seed_label.name}\n")
         lines.append(f"- Files: {s['n_files']} train, {s['n_val_files']} val")
         lines.append(f"- Transitions: {s['n_transitions']}")
         lines.append(f"- Eligible pointers: {s['n_eligible_pointers']}")
         lines.append(f"- Disjoint train/val: {s['train_val_disjoint']}")
+        lines.append(f"- Selected H: {s['selected_H']}, selected h: {s['selected_h']}")
+        lines.append(f"- Selected crowding rho: {s['selected_crowding_rho']}")
+        lines.append(f"- Any legacy_done: {s['any_legacy_done']}")
+        lines.append(f"- Quantize decimals: {s['quantize_decimals']}")
         lines.append(f"- Ep lengths: {s['episode_length_summary']}")
         lines.append(f"- Immediate reward: {s['immediate_reward_summary']}")
         lines.append("")
+
         lines.append("### Return quantiles\n")
         for H_label, qdict in sorted(s["return_quantiles"].items()):
-            lines.append(f"- {H_label}: {qdict}")
+            lines.append(f"- {H_label}: median={qdict['median']}, mean={qdict['mean']}, std={qdict['std']}")
         lines.append("")
+
         lines.append("### Surprise counts\n")
         for h_label, sc in sorted(s["surprise_counts"].items()):
-            lines.append(f"- {h_label}: {sc}")
+            lines.append(f"- {h_label}: up={sc['up_count']} ({sc['up_pct']}%), down={sc['down_count']} ({sc['down_pct']}%)")
         lines.append("")
+
         lines.append("### Sensitivity grid (ESS)\n")
-        lines.append("| Config | ESS | ESS ratio |")
-        lines.append("|--------|-----|-----------|")
+        lines.append(f"| Config | ESS | ESS/N | selected_H | selected_h |")
+        lines.append(f"|--------|-----|-------|------------|------------|")
         for cfg in s["sensitivity_grid"]:
             lines.append(
                 f"| {cfg['name']} | {cfg['effective_sample_size']} | "
-                f"{cfg['ess_ratio']} |"
+                f"{cfg['ess_ratio']} | {cfg['selected_H']} | {cfg['selected_h']} |"
             )
         lines.append("")
-        lines.append("### Dense-region impact\n")
-        lines.append(f"- {s['dense_region_impact']}")
+
+        lines.append("### Active-set simulation\n")
+        as_data = s["sensitivity_grid"][0].get("active_set_simulation", {})
+        for M_label, sim in sorted(as_data.items()):
+            if isinstance(sim, dict) and "skipped" in sim:
+                continue
+            lines.append(f"- M={M_label}: cycles={sim.get('n_cycles', '?')}, "
+                         f"replacement={sim.get('mean_replacement_fraction', '?')}, "
+                         f"jaccard_distance={sim.get('mean_jaccard_distance', '?')}, "
+                         f"unique_pct={sim.get('unique_pointers_pct', '?')}%")
+        lines.append("")
+
+        lines.append("### Density metrics\n")
+        dm = s.get("density_metrics", {})
+        if dm:
+            lines.append(f"- Highest-weight 10% mass: {dm.get('highest_weight_10pct_mass_fraction')}")
+            lines.append(f"- Lowest-return 10% weight: {dm.get('lowest_return_10pct_weight_share')}")
+            lines.append(f"- Highest-return 10% weight: {dm.get('highest_return_10pct_weight_share')}")
+            lines.append(f"- Largest equal-return group: {dm.get('largest_equal_return_group')}")
+            lines.append(f"- Gini weight: {dm.get('gini_weight')}")
+        lines.append("")
+
+        lines.append("### Equal-return crowding sensitivity\n")
+        lines.append("| rho | ESS/N | largest-group weight |")
+        lines.append("|-----|-------|----------------------|")
+        for rho_label, row in sorted(
+            s["crowding_sensitivity"].items(), key=lambda item: float(item[0])
+        ):
+            group = row["density_metrics"]["largest_equal_return_group"]
+            lines.append(
+                f"| {rho_label} | {row['ess_ratio']} | {group['weight_share']} |"
+            )
         lines.append("")
         lines.append("---\n")
-    lines.append("")
-    results_path = out_dir / "RESULTS.md"
+
+    results_path = md_dir / "RESULTS.md"
     with open(results_path, "w") as f:
         f.write("\n".join(lines) + "\n")
-
-
-def _write_run_index(out_dir: Path) -> None:
-    """Write RUN_INDEX.md if not present."""
-    index_path = out_dir.parent / "RUN_INDEX.md"
-    if index_path.exists():
-        return
-    content = """# Memory Component RUN_INDEX
-
-| Directory | Status | Description |
-|-----------|--------|-------------|
-| 00_corpus_inventory | DONE | Factual corpus profiler; seeds 42 & 43 profiled |
-| 01_uniform_replay | — | Reserved for uniform dream baseline |
-| 02_probabilistic_replay | — | Reserved for probabilistic priority replay |
-| 03_latent_cache_ablation | — | Reserved for cached-z vs reconstruction |
-| 04_wake_dream_cycle | — | Reserved for first wake-dream refresh |
-"""
-    with open(index_path, "w") as f:
-        f.write(content)
 
 
 def _json_fallback(obj):
