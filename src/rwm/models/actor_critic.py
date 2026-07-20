@@ -222,7 +222,9 @@ class ActorCritic(nn.Module):
         self.actor = Actor(hidden_dim=cfg.hidden_dim)
         self.critic = Critic(hidden_dim=cfg.hidden_dim)
         self.target_critic = Critic(hidden_dim=cfg.hidden_dim)
-        self._sync_target( tau=1.0)  # hard copy
+        for p in self.target_critic.parameters():
+            p.requires_grad_(False)
+        self._sync_target(tau=1.0)  # hard copy
 
         # Optimisers — only actor/critic params.
         self._actor_optim: Optimizer = torch.optim.Adam(

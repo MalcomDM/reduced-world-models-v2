@@ -115,16 +115,16 @@ deterministically by the spy-based regression test
 ### Stage 2 resolution
 
 ```
-belief b_t = Transformer(obs[t], action[t-1], causal history)
-action a_t = Actor(b_t)                         # future Stage 4
-reward prediction = RewardHead(b_t, action[t]) = r_{t+1}
+belief z_t = Temporal(obs[t], action[t-1], prior temporal context)
+action a_t = Actor(z_t)
+reward prediction = RewardHead(z_t, action[t]) = r_{t+1}
 ```
 
 The previous action belongs in the pre-action belief; the current action is
 supplied separately to the reward head. The active regression tests prove both
-inputs and the reward target. A remaining windowing bug is that a sliding
-window beginning at an interior episode offset still substitutes zero for the
-true `action[offset-1]`; Stage 2.5 must return that action or use burn-in.
+inputs and the reward target. The former interior-window predecessor bug is
+resolved: random recurrent windows include same-episode burn-in and the true
+action immediately preceding the first valid position.
 
 ---
 
@@ -226,7 +226,7 @@ memory is not part of the active Stage 2 training path.
 | Issue | Location | Impact |
 |-------|----------|--------|
 | Historical action/reward shift | Resolved by split belief/reward inputs in Stage 2 | Regression-tested |
-| False zero previous action at interior window starts | `world_model_trainer.py:_compute_batch_loss` | Creates an artificial temporal reset per window |
+| False zero previous action at interior window starts | Resolved by predecessor-action and recurrent burn-in contracts | Regression-tested |
 | `done` mixes terminated/truncated | `collector.py:45` | Future bootstrap value cannot distinguish them |
 | Draft imagination order | `rollout_simulator.py` | Reward is paired with the wrong imagined belief/action phase |
 | Legacy LSTM paths | evaluation and behavior-memory modules | Explicitly disabled; manual command migrated |
@@ -241,14 +241,14 @@ The following decisions are approved for their specified implementation stages.
 ### 11.1 Canonical immediate-reward convention
 
 **Implemented decision:** produce a pre-action belief from the current
-observation, previous action, and causal history; supply the current action
-separately to the immediate reward head.
+observation, previous action, and prior temporal context; supply the current
+action separately to the immediate reward head.
 
 ```
-belief b_t = Transformer(obs[t], action[t-1], causal history)
-Actor(b_t) -> action[t]
-Critic(b_t) -> V(b_t)
-RewardHead(b_t, action[t]) -> reward[t] = r_{t+1}
+belief z_t = MinimalSRU(obs[t], action[t-1], z[t-1])
+Actor(z_t) -> action[t]
+Critic(z_t) -> V(z_t)
+RewardHead(z_t, action[t]) -> reward[t] = r_{t+1}
 ```
 
 This avoids circular dependence in the Actor while preserving current-action

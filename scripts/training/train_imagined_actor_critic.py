@@ -4,14 +4,14 @@
 Usage::
 
     # Fixed-horizon training
-    python scripts/train_imagined_actor_critic.py --checkpoint <path> --horizon 4
+    python scripts/training/train_imagined_actor_critic.py --checkpoint <path> --horizon 4
 
     # Curriculum training (sample H from {1, 2, 4} per batch)
-    python scripts/train_imagined_actor_critic.py --checkpoint <path> \\
+    python scripts/training/train_imagined_actor_critic.py --checkpoint <path> \\
         --horizons 1 2 4 --seed 42
 
     # Smoke test
-    python scripts/train_imagined_actor_critic.py --checkpoint <path> --smoke
+    python scripts/training/train_imagined_actor_critic.py --checkpoint <path> --smoke
 
 The checkpoint must be a Stage-2.5D.1 masked-trained anchor
 (e.g. ``runs/component_refinement/causal_transformer/08_masked_reward_anchor/seed42/checkpoint_best.pt``).
@@ -32,6 +32,7 @@ from torch.utils.data import DataLoader
 from rwm.config.config import ACTION_DIM
 from rwm.config.experiment_config import ExperimentConfig
 from rwm.data.rollout_dataset import RolloutDataset
+from rwm.data.split import collect_and_split
 from rwm.trainers.imagined_actor_critic import (
     ImaginedACTrainer,
     ImaginedACTrainingConfig,
@@ -100,6 +101,10 @@ def main() -> None:
         "--seed", type=int, default=None,
         help="Random seed for reproducibility",
     )
+    parser.add_argument(
+        "--data-split-seed", type=int, default=None,
+        help="File-level train/validation split seed; defaults to checkpoint seed.",
+    )
     args = parser.parse_args()
 
     # ------------------------------------------------------------------
@@ -159,18 +164,43 @@ def main() -> None:
     assert ckpt["config"] is not None, "Checkpoint must have a config"
     exp_config: ExperimentConfig = ckpt["config"]
     data_dir = args.data_dir or exp_config.data.dataset_dir
+    data_split_seed = (
+        args.data_split_seed
+        if args.data_split_seed is not None
+        else int(getattr(exp_config, "seed", 42))
+    )
+    val_ratio = float(getattr(exp_config.data, "val_ratio", 0.2))
+    train_files, val_files = collect_and_split(
+        Path(data_dir), data_split_seed=data_split_seed, val_ratio=val_ratio,
+    )
 
     cache_dir = args.cache_dir
     if cache_dir and not Path(cache_dir).is_dir():
         parser.error(f"--cache-dir does not exist or is not a directory: {cache_dir}")
     seq_len = exp_config.data.sequence_len
 
-    dataset = RolloutDataset(
-        root_dir=Path(data_dir),
-        sequence_len=seq_len,
-        image_size=exp_config.data.image_size,
-        cache_dir=cache_dir,
-    )
+    is_sru = model._temporal_backend == "minimal_sru"
+    burn_in_steps = model._temporal_config.sru_burn_in_steps if is_sru else 0
+    if is_sru:
+        print(f"  SRU backend detected (burn_in_steps={burn_in_steps})")
+        dataset = RolloutDataset.from_file_list(
+            train_files,
+            sequence_len=seq_len,
+            image_size=exp_config.data.image_size,
+            cache_dir=cache_dir,
+            recurrent_context=True,
+            burn_in_steps=burn_in_steps,
+        )
+    else:
+        dataset = RolloutDataset.from_file_list(
+            train_files,
+            sequence_len=seq_len,
+            image_size=exp_config.data.image_size,
+            cache_dir=cache_dir,
+        )
+    loader_generator = torch.Generator(device="cpu")
+    if args.seed is not None:
+        loader_generator.manual_seed(args.seed)
     loader = DataLoader(
         dataset,
         batch_size=train_cfg.batch_size,
@@ -178,8 +208,13 @@ def main() -> None:
         drop_last=True,
         num_workers=2,
         pin_memory=True,
+        generator=loader_generator,
     )
-    print(f"  Dataset: {len(dataset)} windows from {data_dir}")
+    print(
+        f"  Dataset: {len(dataset)} windows from {len(train_files)} train files "
+        f"({len(val_files)} held out; split_seed={data_split_seed}; "
+        f"{'recurrent_context' if is_sru else 'standard'})"
+    )
     if cache_dir:
         print(f"  Cache: {cache_dir}")
 
@@ -224,6 +259,18 @@ def main() -> None:
         probe_batch=probe_batch,
     )
     trainer.set_anchor_info(str(ckpt_path.resolve()), ckpt_hash)
+    trainer.set_data_provenance({
+        "data_root": str(Path(data_dir).resolve()),
+        "data_split_seed": data_split_seed,
+        "training_seed": args.seed,
+        "val_ratio": val_ratio,
+        "train_files": sorted(str(path.resolve()) for path in train_files),
+        "val_files": sorted(str(path.resolve()) for path in val_files),
+        "n_train_files": len(train_files),
+        "n_val_files": len(val_files),
+        "train_val_disjoint": not bool(set(train_files) & set(val_files)),
+        "n_train_windows": len(dataset),
+    })
 
     # ------------------------------------------------------------------
     # Pre-training fixed probe

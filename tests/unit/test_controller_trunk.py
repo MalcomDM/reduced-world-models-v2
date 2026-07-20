@@ -242,7 +242,10 @@ class TestTrainerIntegration:
 
     def test_action_probe_nonlinear_checkpoint(self, tmp_path):
         """Action probe must load a nonlinear checkpoint without crashing."""
-        script_path = Path(__file__).parents[2] / "scripts" / "evaluate_reward_prediction.py"
+        script_path = (
+            Path(__file__).parents[2] / "scripts" / "evaluation"
+            / "evaluate_reward_prediction.py"
+        )
         spec = importlib.util.spec_from_file_location("evaluate_reward_prediction", script_path)
         assert spec is not None and spec.loader is not None
         module = importlib.util.module_from_spec(spec)

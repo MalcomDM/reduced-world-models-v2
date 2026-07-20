@@ -52,7 +52,7 @@ def load_manifest(
         raise ValueError(
             f"Cache manifest not found at {man_path}. "
             "Build the cache first:\n"
-            f"  python scripts/build_frame_cache.py --cache-dir {cache_dir}"
+            f"  python scripts/data/build_frame_cache.py --cache-dir {cache_dir}"
         )
     with open(man_path) as f:
         manifest = json.load(f)
@@ -118,7 +118,7 @@ def verify_cache_entry(
         raise ValueError(
             f"Source {rel} not found in cache manifest file_map. "
             "Rebuild the cache:\n"
-            f"  python scripts/build_frame_cache.py"
+            f"  python scripts/data/build_frame_cache.py"
         )
 
     actual_key = cache_key(source_path, image_size)
@@ -127,14 +127,14 @@ def verify_cache_entry(
             f"Cache key mismatch for {rel}: "
             f"manifest has {expected_key}, source produces {actual_key}. "
             "The source file has changed since caching. Rebuild the cache:\n"
-            f"  python scripts/build_frame_cache.py"
+            f"  python scripts/data/build_frame_cache.py"
         )
 
     cache_path = cache_dir / f"{expected_key}.npy"
     if not cache_path.exists():
         raise ValueError(
             f"Cache file missing: {cache_path}. Rebuild the cache:\n"
-            f"  python scripts/build_frame_cache.py"
+            f"  python scripts/data/build_frame_cache.py"
         )
 
     # Validate shape

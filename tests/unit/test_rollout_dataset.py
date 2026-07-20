@@ -104,7 +104,9 @@ import torch
 
 def _build_frame_cache(data_root: Path, cache_dir: Path, **kwargs):
     """Load the standalone cache-builder script without assuming scripts is a package."""
-    script_path = Path(__file__).parents[2] / "scripts" / "build_frame_cache.py"
+    script_path = (
+        Path(__file__).parents[2] / "scripts" / "data" / "build_frame_cache.py"
+    )
     spec = importlib.util.spec_from_file_location("build_frame_cache_test", script_path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)

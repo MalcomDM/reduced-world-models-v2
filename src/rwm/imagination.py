@@ -1,17 +1,19 @@
-"""Differentiable bounded-context imagination interface (Stage 3.0).
+"""Differentiable bounded-context imagination interface (Stage 3.0 / S5.0).
 
 Warm up from observed frames, then score-and-advance through imagined steps
-using only the causal Transformer and ControllerTrunk.  No perception/CNN is
-called on dummy images during imagined steps.
+using either the causal Transformer or MinimalSRU.
 
-State semantics (from the transition contract):
+Causal semantics (Stage 3.0)::
 
     z_t = Transformer(H_t)              — belief from causal token history
     r_hat[t] = RewardHead(z_t, a_t)     — score before advancing
     H_(t+1) = append(cat(zeros, a_t))   — blind advance (no image)
 
-Never uses ``torch.no_grad()``, ``.item()``, or ``.detach()`` in trainable
-rollout paths, preserving end-to-end differentiability.
+SRU semantics (S5.0)::
+
+    z_t = MinimalSRU.step(x_t, z_{t-1})  — recurrent state
+    r_hat[t] = RewardHead(z_t, a_t)     — score before advancing
+    z_{t+1} = blind_sru_step(z_t, a_t)  — blind advance (z only)
 """
 
 from __future__ import annotations
@@ -34,20 +36,25 @@ from rwm.utils.history_buffer import HistoryBuffer
 
 @dataclass
 class ImaginationState:
-    """Causal state after observed warmup.
+    """Causal or SRU state after observed warmup.
 
     Fields
     ------
     history:
-        ``(B, T, V+A)`` — all tokens from the warmup sequence.
+        ``(B, T, V+A)`` — all tokens from the warmup sequence (causal) or
+        placeholder ``(B, 1, V+A)`` (SRU, not meaningful).
     lengths:
-        ``(B,)`` — ``T`` for every batch element.
+        ``(B,)`` — ``T`` for causal, ``1`` for SRU (placeholder).
     beliefs:
-        ``(B, T, D)`` — per-step causal beliefs (before controller).
+        ``(B, T, D)`` — per-step beliefs (causal Transformer output) or
+        per-step SRU states ``z_t``.
+    is_sru:
+        ``True`` if this state was produced by an SRU backend.
     """
     history: Tensor
     lengths: Tensor
     beliefs: Tensor
+    is_sru: bool = False
 
     @property
     def current_belief(self) -> Tensor:
@@ -71,9 +78,12 @@ class RolloutOutput:
     next_state:
         ``(B, D)`` — belief after the final imagined step.
     history:
-        ``(B, T_total, V+A)`` — accumulated history after all steps.
+        ``(B, T_total, V+A)`` — accumulated history after all steps
+        (causal) or placeholder ``(B, 1, V+A)`` (SRU).
     lengths:
         ``(B,)`` — valid lengths after all steps.
+    is_sru:
+        ``True`` for SRU backends.
     """
     states: Tensor
     actions: Tensor
@@ -81,6 +91,7 @@ class RolloutOutput:
     next_state: Tensor
     history: Tensor
     lengths: Tensor
+    is_sru: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -90,20 +101,16 @@ class RolloutOutput:
 class ImaginationRollout(nn.Module):
     """Differentiable bounded-context imagination interface.
 
-    Owns a reference to the world model (not the model itself).  All
-    tensor operations preserve gradient flow and never call ``item()``,
-    ``detach()``, or ``torch.no_grad()``.
-
     Parameters
     ----------
     model:
-        A ``ReducedWorldModel`` instance whose ``world_hd`` and
-        ``controller`` are used for score-and-advance.
+        A ``ReducedWorldModel`` instance.
     """
 
     def __init__(self, model: ReducedWorldModel) -> None:
         super().__init__()
         self.model = model
+        self._is_sru = model._temporal_backend == "minimal_sru"
 
     # ------------------------------------------------------------------
     # Warmup from observed frames
@@ -116,34 +123,53 @@ class ImaginationRollout(nn.Module):
         current_actions: Optional[Tensor] = None,  # (B, T, A) or None
         force_keep_input: bool = True,
         observation_keep: Optional[Tensor] = None,  # (B, T) bool
+        valid_step: Optional[Tensor] = None,  # (B, T) bool — SRU only
     ) -> ImaginationState:
-        """Run observed warmup and return the causal state.
-
-        Uses ``forward_sequence`` for vectorised perception and a
-        re-entrant transformer call to extract per-step beliefs.
-        When ``current_actions`` is ``None``, zeros are used only to satisfy
-        the existing full-sequence API; warmup reward predictions are ignored.
-        """
+        """Run observed warmup and return the imagination state."""
         if current_actions is None:
             current_actions = torch.zeros(
                 obs.shape[0], obs.shape[1], ACTION_DIM,
                 device=obs.device, dtype=obs.dtype,
             )
 
+        if self._is_sru:
+            return self._warmup_sru(obs, prev_actions, current_actions,
+                                    force_keep_input, observation_keep, valid_step)
+
+        # Causal warmup (unchanged).
         out = self.model.forward_sequence(
             obs, prev_actions, current_actions,
             force_keep_input=force_keep_input,
             observation_keep=observation_keep,
         )
-
         beliefs = self.model.world_hd(
             out.history, lengths=out.lengths, return_all=True,
         )
-
         return ImaginationState(
-            history=out.history,
-            lengths=out.lengths,
-            beliefs=beliefs,
+            history=out.history, lengths=out.lengths, beliefs=beliefs, is_sru=False,
+        )
+
+    def _warmup_sru(
+        self,
+        obs: Tensor, prev_actions: Tensor, current_actions: Tensor,
+        force_keep_input: bool, observation_keep: Optional[Tensor],
+        valid_step: Optional[Tensor] = None,
+    ) -> ImaginationState:
+        """SRU warmup: extract per-step z_t states."""
+        beliefs = self.model.get_sru_warmup_beliefs(
+            obs, prev_actions, current_actions,
+            force_keep_input=force_keep_input,
+            valid_step=valid_step,
+            observation_keep=observation_keep,
+        )
+        # Placeholder history for compatibility.
+        B = obs.shape[0]
+        device = obs.device
+        placeholder_hist = torch.zeros(B, 1, VALUES_DIM + ACTION_DIM, device=device)
+        placeholder_lens = torch.ones(B, dtype=torch.long, device=device)
+        return ImaginationState(
+            history=placeholder_hist, lengths=placeholder_lens,
+            beliefs=beliefs, is_sru=True,
         )
 
     # ------------------------------------------------------------------
@@ -151,20 +177,7 @@ class ImaginationRollout(nn.Module):
     # ------------------------------------------------------------------
 
     def score(self, belief: Tensor, action: Tensor) -> Tensor:
-        """Predict reward ``r_hat[t+1] = Reward(z_t, a_t)``.
-
-        Parameters
-        ----------
-        belief:
-            ``(B, D)`` — causal belief ``z_t``.
-        action:
-            ``(B, A)`` — candidate action ``a_t``.
-
-        Returns
-        -------
-        reward:
-            ``(B, 1)`` — predicted reward for taking ``a_t`` at belief ``z_t``.
-        """
+        """Predict reward ``r_hat[t+1] = Reward(z_t, a_t)``."""
         h = self.model.controller.encode(belief)
         return self.model.controller.predict_reward(h, action)
 
@@ -174,35 +187,46 @@ class ImaginationRollout(nn.Module):
 
     def advance(
         self,
-        history: Tensor,   # (B, T_prev, V+A)
-        lengths: Tensor,   # (B,)
+        history: Tensor,   # (B, T_prev, V+A) — causal only
+        lengths: Tensor,   # (B,) — causal only
         action: Tensor,    # (B, A)
+        temporal_state: Optional[Tensor] = None,  # (B, D) — SRU only
     ) -> Tuple[Tensor, Tensor, Tensor]:
         """Advance one blind (no-image) step.
 
-        Builds token ``cat(zero_spatial, action)``, appends it to the
-        history buffer (with left truncation), runs the causal Transformer,
-        and returns the updated history, lengths, and new belief.
+        SRU path (when ``temporal_state is not None``)::
 
-        Parameters
-        ----------
-        history:
-            Current token history ``(B, T_prev, V+A)``.
-        lengths:
-            ``(B,)`` — valid lengths in ``history``.
-        action:
-            ``(B, A)`` — action to append as the *previous* action for the
-            next state.
+            z_{t+1} = blind_sru_step(z_t, action)
+
+        Causal path::
+
+            H_(t+1) = append(cat(zeros, action), H_t)
+            z_{t+1} = Transformer(H_(t+1))
 
         Returns
         -------
-        new_history:
-            ``(B, T_new, V+A)`` — ``T_new = min(T_prev + 1, SEQ_LEN)``.
-        new_lengths:
-            ``(B,)`` — ``T_new`` for every batch element.
-        new_belief:
-            ``(B, D)`` — causal belief at the new last position.
+        new_history, new_lengths, new_belief
         """
+        if self._is_sru and temporal_state is None:
+            raise ValueError(
+                "SRU advance requires an explicit temporal_state. "
+                "Pass the previous SRU state."
+            )
+        if not self._is_sru and temporal_state is not None:
+            raise ValueError(
+                "Causal advance does not accept temporal_state. "
+                "Pass history and lengths instead."
+            )
+        if temporal_state is not None:
+            # SRU blind advance — no history needed.
+            new_z = self.model.blind_sru_step(temporal_state, action)
+            B = action.shape[0]
+            device = action.device
+            placeholder_hist = torch.zeros(B, 1, VALUES_DIM + ACTION_DIM, device=device)
+            placeholder_lens = torch.ones(B, dtype=torch.long, device=device)
+            return placeholder_hist, placeholder_lens, new_z
+
+        # Causal blind advance (unchanged).
         B = action.shape[0]
         device = action.device
         dtype = history.dtype
@@ -211,11 +235,8 @@ class ImaginationRollout(nn.Module):
         zero_spatial = torch.zeros(B, VALUES_DIM, device=device, dtype=dtype)
         blind_token = torch.cat([zero_spatial, action], dim=-1).unsqueeze(1)
 
-        buf = HistoryBuffer.from_history(
-            SEQ_LEN, input_dim, history, lengths,
-        )
+        buf = HistoryBuffer.from_history(SEQ_LEN, input_dim, history, lengths)
         new_history, new_lengths = buf.append(blind_token)
-
         new_belief = self.model.world_hd(new_history, lengths=new_lengths)
         return new_history, new_lengths, new_belief
 
@@ -225,10 +246,11 @@ class ImaginationRollout(nn.Module):
 
     def rollout(
         self,
-        history: Tensor,       # (B, T_warm, V+A)
-        lengths: Tensor,       # (B,)
+        history: Tensor,       # (B, T_warm, V+A) — causal only
+        lengths: Tensor,       # (B,) — causal only
         initial_belief: Tensor,  # (B, D)
         actions: Tensor,       # (B, H, A)
+        temporal_state: Optional[Tensor] = None,  # (B, D) — SRU only
     ) -> RolloutOutput:
         """Differentiable multi-step imagined rollout.
 
@@ -236,27 +258,27 @@ class ImaginationRollout(nn.Module):
 
             1. **Score**:  ``r_hat[h] = Reward(belief, actions[:, h])``
             2. **Record**: store the belief and reward.
-            3. **Advance**: append ``cat(zeros, actions[:, h])``, update
-               history, and compute the next belief.
+            3. **Advance**: update state (causal: append token; SRU: blind step).
 
         Parameters
         ----------
-        history:
-            Token history from warmup ``(B, T_warm, V+A)``.
-        lengths:
-            ``(B,)`` — valid lengths in ``history``.
-        initial_belief:
-            ``(B, D)`` — belief at the last warmup step (``z_0``).
-        actions:
-            ``(B, H, A)`` — imagined action sequence.
-
-        Returns
-        -------
-        ``RolloutOutput`` with fields described in the class docstring.
+        temporal_state:
+            Initial SRU state.  When provided, the SRU path is used.
         """
         B, H = actions.shape[0], actions.shape[1]
         device = actions.device
         d_model = initial_belief.shape[-1]
+
+        if self._is_sru and temporal_state is None:
+            raise ValueError(
+                "SRU rollout requires an explicit temporal_state. "
+                "Pass the initial SRU state."
+            )
+        if not self._is_sru and temporal_state is not None:
+            raise ValueError(
+                "Causal rollout does not accept temporal_state. "
+                "Pass history and lengths instead."
+            )
 
         states = torch.empty(B, H, d_model, device=device, dtype=initial_belief.dtype)
         rewards = torch.empty(B, H, device=device, dtype=initial_belief.dtype)
@@ -264,6 +286,7 @@ class ImaginationRollout(nn.Module):
         belief = initial_belief
         curr_hist = history
         curr_lens = lengths
+        curr_z = temporal_state  # None for causal
 
         for h in range(H):
             a_t = actions[:, h, :]  # (B, A)
@@ -273,13 +296,15 @@ class ImaginationRollout(nn.Module):
             states[:, h, :] = belief
             rewards[:, h] = r_t.squeeze(-1)
 
-            curr_hist, curr_lens, belief = self.advance(curr_hist, curr_lens, a_t)
+            curr_hist, curr_lens, belief = self.advance(
+                curr_hist, curr_lens, a_t, temporal_state=curr_z,
+            )
+            if curr_z is not None:
+                curr_z = belief  # SRU: belief IS the next z
 
+        is_sru = (temporal_state is not None)
         return RolloutOutput(
-            states=states,
-            actions=actions,
-            rewards=rewards,
-            next_state=belief,
-            history=curr_hist,
-            lengths=curr_lens,
+            states=states, actions=actions, rewards=rewards,
+            next_state=belief, history=curr_hist, lengths=curr_lens,
+            is_sru=is_sru,
         )

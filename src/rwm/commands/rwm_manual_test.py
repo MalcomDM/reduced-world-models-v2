@@ -91,6 +91,7 @@ def run(
     prev_action = torch.zeros(1, ACTION_DIM, device=device)
     history: Optional[torch.Tensor] = None
     lengths: Optional[torch.Tensor] = None
+    temporal_state: Optional[torch.Tensor] = None
     true_rewards: list[float] = []
     predicted_rewards: list[float] = []
     rows: list[tuple[int, int, float, float]] = []
@@ -111,6 +112,7 @@ def run(
                     current_action=current_action,
                     history=history,
                     lengths=lengths,
+                    temporal_state=temporal_state,
                 )
             prediction = float(output.reward_pred.squeeze().item())
             next_obs, reward, terminated, truncated, _ = env.step(action)
@@ -126,7 +128,15 @@ def run(
             fig.canvas.draw_idle()
             fig.canvas.flush_events()
 
-            history, lengths = output.history, output.lengths
+            if output.temporal_state is not None:
+                # MinimalSRU carries only z_t; do not also retain the causal
+                # compatibility history returned in WorldModelOutput.
+                temporal_state = output.temporal_state
+                history, lengths = None, None
+            else:
+                # Causal Transformer carries its bounded token history.
+                history, lengths = output.history, output.lengths
+                temporal_state = None
             prev_action = current_action
             obs = next_obs
             step += 1
@@ -136,6 +146,7 @@ def run(
                 obs, _ = env.reset()
                 prev_action = torch.zeros(1, ACTION_DIM, device=device)
                 history, lengths = None, None
+                temporal_state = None
                 true_rewards.clear()
                 predicted_rewards.clear()
                 episode += 1

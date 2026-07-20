@@ -14,8 +14,8 @@ __pycache__/
 *.nbconvert
 
 # Specific to your request: Ignore all content inside the 'runs' folder
-runs/
-data/
+/runs/
+/data/
 
 # environment
 .env

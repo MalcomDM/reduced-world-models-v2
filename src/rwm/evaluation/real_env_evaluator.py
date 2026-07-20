@@ -3,16 +3,19 @@
 Timing contract (approved)::
 
     obs_t = env state before action a_t
-    belief z_t = Transformer(obs_t, action_{t-1})
-    Actor chooses a_t = mode(z_t)            (deterministic)
-    Reward(z_t, a_t) = r_hat_{t+1}          (predicted)
-    env.step(a_t) → obs_{t+1}, r_{t+1}     (real)
+    belief z_t = Transformer(obs_t, action_{t-1})     — causal
+    belief z_t = SRU(obs_t, action_{t-1})              — SRU
+    Actor chooses a_t = mode(z_t)                      (deterministic)
+    Reward(z_t, a_t) = r_hat_{t+1}                     (predicted)
+    env.step(a_t) → obs_{t+1}, r_{t+1}                 (real)
 """
 
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
+import warnings
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -33,6 +36,46 @@ _MAX_STEPS = 1000
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def verify_actor_checkpoint_anchor(
+    anchor_path: Path,
+    ac_checkpoint_path: Path,
+) -> Tuple[str, bool]:
+    """Verify that an Actor-Critic checkpoint belongs to ``anchor_path``.
+
+    Returns the current anchor hash and whether the Actor-Critic checkpoint
+    contained verifiable provenance. Legacy checkpoints without an embedded
+    anchor hash remain loadable, but emit a warning instead of claiming
+    successful verification.
+    """
+    digest = hashlib.sha256()
+    digest.update(anchor_path.read_bytes())
+    actual_hash = digest.hexdigest()[:16]
+
+    checkpoint = torch.load(
+        ac_checkpoint_path, map_location="cpu", weights_only=False,
+    )
+    embedded_anchor = checkpoint.get("anchor") or {}
+    embedded_hash = embedded_anchor.get("hash")
+
+    if embedded_hash is None:
+        warnings.warn(
+            "Actor-Critic checkpoint has no embedded anchor hash; "
+            "anchor integrity cannot be verified",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return actual_hash, False
+
+    if embedded_hash != actual_hash:
+        raise ValueError(
+            f"Anchor hash mismatch: checkpoint expects {embedded_hash}, "
+            f"got {actual_hash} from {anchor_path}"
+        )
+
+    return actual_hash, True
+
 
 def _validate_seed(seed: int, manifest: SeedManifest) -> None:
     """Allow real-policy evaluation only on the locked manifest's dev split."""
@@ -57,8 +100,9 @@ def _validate_seed(seed: int, manifest: SeedManifest) -> None:
 class EpisodeResult:
     """Record of one evaluated episode."""
 
-    def __init__(self, seed: int) -> None:
+    def __init__(self, seed: int, rng_seed: Optional[int] = None) -> None:
         self.seed = seed
+        self.rng_seed = rng_seed
         self.steps: List[Dict[str, float]] = []
         self.terminated: bool = False
         self.truncated: bool = False
@@ -106,6 +150,9 @@ def run_episode(
 ) -> EpisodeResult:
     """Run one deterministic evaluation episode.
 
+    Supports both causal Transformer and MinimalSRU backends.
+    Causal carries ``history``/``lengths``; SRU carries ``temporal_state``.
+
     Parameters
     ----------
     model:
@@ -129,6 +176,8 @@ def run_episode(
     for p in model.parameters():
         p.requires_grad_(False)
 
+    is_sru = getattr(model, "_temporal_backend", "causal_transformer") == "minimal_sru"
+
     env = make_env("car_racing", render_mode=render_mode)
     obs, _ = env.reset(seed=int(seed))
     result = EpisodeResult(seed)
@@ -136,6 +185,7 @@ def run_episode(
     prev_action_np = np.zeros(ACTION_DIM, dtype=np.float32)
     history_t = None
     lengths_t = None
+    temporal_state_t = None  # SRU only
 
     for step in range(max_steps):
         # Preprocess observation.
@@ -151,6 +201,7 @@ def run_episode(
                 history=history_t,
                 lengths=lengths_t,
                 force_keep_input=True,
+                temporal_state=temporal_state_t,
             )
 
             z_t = out.world_state
@@ -187,8 +238,11 @@ def run_episode(
 
         # Advance state.
         prev_action_np = action_np
-        history_t = out.history
-        lengths_t = out.lengths
+        if is_sru:
+            temporal_state_t = out.temporal_state
+        else:
+            history_t = out.history
+            lengths_t = out.lengths
         obs = next_obs
 
     env.close()
@@ -229,6 +283,57 @@ def run_zero_baseline(
     return result
 
 
+def run_random_baseline(
+    seed: int,
+    manifest: SeedManifest,
+    max_steps: int = _MAX_STEPS,
+    render_mode: str = "rgb_array",
+    rng_seed: Optional[int] = None,
+) -> EpisodeResult:
+    """Run one episode with deterministic random actions (bounded).
+
+    Actions are sampled from a seeded RNG at each step:
+      steer  ~ Uniform(-1, 1)
+      gas    ~ Uniform(0, 1)
+      brake  ~ Uniform(0, 1)
+
+    Parameters
+    ----------
+    rng_seed:
+        If given, the random policy is deterministic across calls.
+        Defaults to ``seed + 10000``.
+    """
+    _validate_seed(seed, manifest)
+    if rng_seed is None:
+        rng_seed = seed + 10000
+    rng = np.random.RandomState(rng_seed)
+
+    env = make_env("car_racing", render_mode=render_mode)
+    obs, _ = env.reset(seed=int(seed))
+    result = EpisodeResult(seed, rng_seed=rng_seed)
+
+    for step in range(max_steps):
+        steer = float(rng.uniform(-1.0, 1.0))
+        gas = float(rng.uniform(0.0, 1.0))
+        brake = float(rng.uniform(0.0, 1.0))
+        action_np = np.array([steer, gas, brake], dtype=np.float32)
+
+        _, reward_real, terminated, truncated, _ = env.step(action_np)
+        result.record_step(
+            action=action_np,
+            reward_true=reward_real,
+            reward_pred=0.0,
+            value=0.0,
+            logstd=np.zeros(ACTION_DIM),
+        )
+        if terminated or truncated:
+            result.set_done(terminated, truncated)
+            break
+
+    env.close()
+    return result
+
+
 # ---------------------------------------------------------------------------
 # CSV / JSON persistence
 # ---------------------------------------------------------------------------
@@ -255,14 +360,17 @@ def save_episode_csv(episode: EpisodeResult, path: Path) -> None:
 
 def save_episode_json(episode: EpisodeResult, path: Path) -> None:
     """Save episode summary and per-step data as JSON."""
-    data = {
+    data: Dict = {
         "seed": episode.seed,
         "n_steps": episode.n_steps,
         "cumulative_reward": episode.cumulative_reward,
         "terminated": episode.terminated,
         "truncated": episode.truncated,
-        "steps": episode.steps,
     }
+    if episode.rng_seed is not None:
+        data["rng_seed"] = episode.rng_seed
+    data["steps"] = episode.steps
+
     with open(path, "w") as f:
         json.dump(data, f, indent=2, sort_keys=True)
 

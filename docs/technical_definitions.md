@@ -99,15 +99,15 @@ Architectural ownership does not change temporal semantics. The approved
 transition contract is:
 
 ```text
-current reduced observation p_t + previous action a_{t-1} + history
-    → pre-action belief b_t
+current reduced observation p_t + previous action a_{t-1} + state z_{t-1}
+    → recurrent pre-action belief z_t
     → shared controller interpretation u_t
-        ├── action distribution π(a_t | b_t)
-        ├── value estimate V(b_t)
-        └── reward prediction R(b_t, a_t) = r_{t+1}
+        ├── action distribution π(a_t | z_t)
+        ├── value estimate V(z_t)
+        └── reward prediction R(z_t, a_t) = r_{t+1}
 
 next step:
-    p_{t+1} when visible + a_t + history → b_{t+1}
+    p_{t+1} when visible + a_t + z_t → z_{t+1}
 ```
 
 The rollout dataset stores `obs[t]` before `env.step(action[t])` and stores the
@@ -141,40 +141,38 @@ The selected-token ratio does not equal effective image coverage because each to
 The temporal world model receives:
 
 - current reduced perceptual representation when available;
-- the previous action and causal action/history context;
-- temporal context.
+- the previous action;
+- the previous recurrent state.
 
 Conceptually:
 
 ```text
-p_t + a_{t-1} + causal history
-    → temporal world model
-    → pre-action belief b_t
+p_t + a_{t-1} + z_{t-1}
+    → MinimalSRU
+    → pre-action belief z_t
 ```
 
 The belief is conditioned on actions already taken. The Actor then selects
-`a_t`, the reward head evaluates `(b_t, a_t)`, and `a_t` enters the temporal
-context used to produce the next belief.
+`a_t`, the reward head evaluates `(z_t, a_t)`, and `a_t` enters the recurrent
+transition used to produce the next belief.
 
 ### Observational Dropout
 
 Observational dropout is applied after spatial pruning.
 
-At selected time steps, the temporal model must continue operating without fresh perceptual tokens. This forces the internal state to preserve and evolve task-relevant information using:
+At selected time steps, the temporal model continues operating without fresh
+perceptual tokens. This forces `z_t` to preserve and evolve task-relevant
+information using:
 
 - previous state;
-- actions;
-- temporal history.
+- actions.
 
 The current hypothesis is that useful action-conditioned dynamics can emerge naturally from this pressure.
 
-The motivating observational-dropout work recursively carries the model's
-generated state while observations are hidden. A finite-context causal
-Transformer may instead reconstruct a bounded belief from the last visible
-context and subsequent actions. These are not automatically equivalent. The
-implementation must be evaluated under contiguous masked horizons and must
-either preserve a generated state or demonstrate that the bounded context is
-sufficient before it is used for imagination.
+MinimalSRU recursively carries the generated state while observations are
+hidden. This contract was validated under contiguous H=1/2/4/8/12 masked
+horizons and through z-only imagined transitions. The former finite-context
+causal Transformer is retained only on the reproducible baseline branch.
 
 ### Explicit Next-State Head
 
@@ -640,6 +638,15 @@ drift, and per-loss gradient alignment must be monitored. Loss weighting is the
 first stabilization mechanism. Gradient surgery or separate optimizers should
 only be introduced if measured conflicts require them.
 
+The Stage-6.0 joint-gradient audit (`src/rwm/evaluation/joint_gradient_audit.py`)
+measures all six losses (visible reward MSE, masked reward MSE, tokenizer KL,
+Critic, Actor, entropy) against eleven parameter blocks. It records gradient L2
+norms, parameter L2 norms, ratios, and pairwise cosine similarities, and
+verifies that parameter hashes, `requires_grad` flags, and optimizer state are
+unchanged after measurement. The audit reconstructs SRU states from scratch
+(no cached `z`) and supports two modes: eval-parity (tokenizer mean,
+deterministic) and gradient-audit (seeded train mode, tokenizer sample).
+
 ---
 
 ## Imagined Trajectories
@@ -723,9 +730,12 @@ Memory may still be useful as a replay and retention system.
 
 A future replay record may contain:
 
+- immutable source episode/file and timestep;
+- policy, dataset, and world-model checkpoint provenance;
 - observation or encoded scenario;
 - action;
 - reward;
+- horizon-specific future return and terminated/truncated flags;
 - historical score;
 - current Critic value;
 - prediction error;
@@ -749,6 +759,34 @@ A future design may combine:
 - novelty;
 - rarity;
 - historical significance.
+
+### Latent replay golden rules
+
+- **Factual pointers are permanent; latent states are disposable.** The source
+  episode/timestep is the ground truth from which a current state can be
+  reconstructed.
+- **MinimalSRU needs only `z_t` to resume.** A cached start does not need an
+  observation or temporal-history buffer during a frozen-world dream phase.
+- **Every cached `z_t` is versioned by the exact world-model parameter hash.**
+  Any world-model update invalidates the complete latent cache.
+- **Cached starts train Actor/Critic efficiently but do not provide gradients
+  into the earlier world-model path.** Joint-gradient stages must reconstruct
+  `z_t` from the factual pointer with the current model.
+- **Recorded behavior return is evidence, not an Actor ceiling or an unbiased
+  Critic target.** The current policy may improve on it, and off-policy returns
+  require explicit interpretation.
+- **Sampling starts uniform.** Prioritization is introduced only after a
+  measured limitation and must mix ordinary coverage with positive, negative,
+  surprising, rare, and terminal experience rather than retaining only high
+  rewards.
+- **Capacity is bounded per stratum.** FIFO/reservoir replacement lets useful
+  new experience displace old entries without erasing rare factual probes.
+- **Latent replay is an efficiency layer, not a prerequisite for the first S5
+  correctness and behavioral checkpoint.**
+
+The canonical record, invalidation, gradient, and sampling rules live in
+`docs/contracts/latent_memory_contract.md`. Stage scheduling remains in
+`docs/plans/implementation_plan.md`, under “Optional latent-anchor replay.”
 
 ---
 
@@ -811,9 +849,9 @@ These remain intentionally open:
 - total loss weights;
 - learning rates per architectural block;
 - gradient clipping;
-- replay policy;
+- exact replay-mixture weights after the uniform baseline;
 - progressive update cadence;
-- replay-priority refresh strategy;
+- priority refresh cadence after a prioritized-replay limitation is measured;
 - external baseline selection;
 - criteria for expanding beyond `CarRacing-v3`.
 

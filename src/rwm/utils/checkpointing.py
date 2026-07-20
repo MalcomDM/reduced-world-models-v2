@@ -170,6 +170,76 @@ def load_checkpoint(
 _VALID_REWARD_HEAD_KINDS = ("linear", "nonlinear")
 
 
+_VALID_TEMPORAL_BACKENDS = ("causal_transformer", "minimal_sru")
+
+
+def _resolve_temporal_config(cfg: Any) -> "TemporalConfig":
+    """Extract ``TemporalConfig`` from a checkpoint config with defaults."""
+    from rwm.config.experiment_config import TemporalConfig
+
+    if cfg is None:
+        return TemporalConfig()
+
+    tc = None
+    if hasattr(cfg, "temporal"):
+        tc = cfg.temporal
+    elif isinstance(cfg, dict) and "temporal" in cfg:
+        tc = TemporalConfig.from_dict(cfg["temporal"])
+
+    if tc is not None:
+        return tc
+    return TemporalConfig()
+
+
+def _check_backend_compatibility(
+    temporal_cfg: "TemporalConfig",
+    state_dict: Dict[str, Any],
+) -> None:
+    """Raise ``ValueError`` if the backend and state_dict keys are incompatible.
+
+    Detection rules:
+    - If state_dict contains ``world_hd.projection.*`` → SRU checkpoint.
+    - If state_dict contains ``world_hd.input_proj.*`` → causal checkpoint.
+    - If config backend disagrees with detected keys → error.
+    - If no config (legacy) or no temporal keys → silently accept (auto-detect
+      will use the config default or the detected keys in a future enhancement).
+    """
+    has_causal_keys = any(k.startswith("world_hd.input_proj") or
+                          k.startswith("world_hd.pos_emb") or
+                          k.startswith("world_hd.encoder") for k in state_dict)
+    has_sru_keys = any(k.startswith("world_hd.projection") for k in state_dict)
+
+    if has_causal_keys and temporal_cfg.backend == "minimal_sru":
+        raise ValueError(
+            "Architecture mismatch: checkpoint contains causal Transformer "
+            "world_hd keys (e.g., 'world_hd.input_proj.weight') but config "
+            f"specifies backend='{temporal_cfg.backend}'. "
+            "Use backend='causal_transformer' to load this checkpoint."
+        )
+    if has_sru_keys and temporal_cfg.backend == "causal_transformer":
+        raise ValueError(
+            "Architecture mismatch: checkpoint contains SRU world_hd keys "
+            "(e.g., 'world_hd.projection.weight') but config specifies "
+            f"backend='{temporal_cfg.backend}'. "
+            "Use backend='minimal_sru' to load this checkpoint."
+        )
+
+    # Legacy checkpoints with no temporal backend info: auto-detect from keys.
+    if temporal_cfg.backend == "causal_transformer" and has_sru_keys:
+        raise ValueError(
+            "Architecture mismatch: checkpoint contains SRU world_hd keys "
+            "(e.g., 'world_hd.projection.weight') but no temporal backend "
+            "was specified.  Use backend='minimal_sru' to load this checkpoint."
+        )
+    if temporal_cfg.backend == "minimal_sru" and has_causal_keys:
+        raise ValueError(
+            "Architecture mismatch: checkpoint contains causal Transformer "
+            "world_hd keys (e.g., 'world_hd.input_proj.weight') but config "
+            f"specifies backend='{temporal_cfg.backend}'. "
+            "Use backend='causal_transformer' to load this checkpoint."
+        )
+
+
 def model_from_checkpoint(
     checkpoint: Dict[str, Any],
     action_dim: int = 3,
@@ -177,9 +247,13 @@ def model_from_checkpoint(
 ) -> "torch.nn.Module":
     """Build a ``ReducedWorldModel`` from checkpoint metadata.
 
-    Reads reward-head and selection configuration from the checkpoint's
-    ``config``.  Legacy/missing fields default to ``"linear"`` head and
-    ``"learned"`` selection with ``k=8``.
+    Reads reward-head, selection, and temporal-backend configuration from
+    the checkpoint's ``config``.  Legacy/missing fields default to
+    ``"linear"`` head, ``"learned"`` selection with ``k=8``, and
+    ``"causal_transformer"`` temporal backend.
+
+    Cross-backend loading raises a clear ``ValueError`` — a causal checkpoint
+    must never be silently guessed as SRU, and vice versa.
 
     Parameters
     ----------
@@ -203,6 +277,8 @@ def model_from_checkpoint(
     tok_eval_mode = "sample"
 
     cfg = checkpoint.get("config")
+    temporal_cfg = _resolve_temporal_config(cfg)
+
     if cfg is not None:
         # Controller config
         ctrl_cfg = None
@@ -243,6 +319,10 @@ def model_from_checkpoint(
             "Must be a positive integer."
         )
 
+    # Validate temporal backend compatibility before building the model.
+    state_dict = checkpoint.get("model_state", {})
+    _check_backend_compatibility(temporal_cfg, state_dict)
+
     model = ReducedWorldModel(
         action_dim=action_dim,
         reward_head_kind=kind,
@@ -251,6 +331,7 @@ def model_from_checkpoint(
         selection_k=sel_k,
         selection_seed=sel_seed,
         tokenizer_eval_mode=tok_eval_mode,
+        temporal_config=temporal_cfg,
     )
     model.load_state_dict(checkpoint["model_state"])
     return model

@@ -5,11 +5,11 @@ import json
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
 
-import torch
 from torch.utils.data import DataLoader
 
 from rwm.models.rwm.model import ReducedWorldModel
@@ -19,6 +19,7 @@ from rwm.evaluation.masked_factual_evaluator import (
     _make_prev_actions_correct,
     _make_prev_actions_zero,
     _make_prev_actions_shifted,
+    _make_target_masks,
 )
 
 
@@ -99,6 +100,64 @@ class TestObservationMask:
         keep = _make_observation_keep(T=6, warmup=2, mask_horizon=10, device="cpu")
         assert keep[:, :2].all()
         assert (~keep[:, 2:]).all()
+
+    @pytest.mark.parametrize("horizon", [1, 2, 4, 8, 12])
+    def test_recurrent_mask_is_relative_to_target_region(self, horizon):
+        """SRU burn-in remains visible; warmup begins at the loss target."""
+        B, T = 2, 36
+        valid = torch.ones(B, T, dtype=torch.bool)
+        loss_mask = torch.zeros(B, T, dtype=torch.bool)
+        loss_mask[:, 20:36] = True
+
+        keep, score, variants = _make_target_masks(
+            loss_mask=loss_mask,
+            valid_step=valid,
+            batch_size=B,
+            sequence_len=T,
+            warmup=4,
+            mask_horizon=horizon,
+            device=torch.device("cpu"),
+        )
+
+        assert keep[:, :24].all()
+        assert (~keep[:, 24:24 + horizon]).all()
+        assert keep[:, 24 + horizon:].all()
+        torch.testing.assert_close(score, ~keep)
+        torch.testing.assert_close(variants, score)
+        assert int(score.sum().item()) == B * horizon
+
+    def test_recurrent_mask_excludes_padding_and_requires_valid_targets(self):
+        B, T = 2, 36
+        valid = torch.ones(B, T, dtype=torch.bool)
+        valid[0, :7] = False
+        loss_mask = torch.zeros(B, T, dtype=torch.bool)
+        loss_mask[:, 20:36] = True
+
+        keep, score, _ = _make_target_masks(
+            loss_mask=loss_mask,
+            valid_step=valid,
+            batch_size=B,
+            sequence_len=T,
+            warmup=4,
+            mask_horizon=4,
+            device=torch.device("cpu"),
+        )
+
+        assert not keep[0, :7].any()
+        assert not score[0, :7].any()
+        assert (~keep[:, 24:28]).all()
+        assert int(score.sum().item()) == 8
+
+    def test_predecessor_action_is_placed_at_first_valid_position(self):
+        actions = torch.arange(36 * 3, dtype=torch.float32).view(1, 36, 3)
+        predecessor = torch.tensor([[99.0, 98.0, 97.0]])
+        valid = torch.zeros(1, 36, dtype=torch.bool)
+        valid[:, 7:] = True
+
+        prev = _make_prev_actions_correct(actions, predecessor, valid_step=valid)
+
+        torch.testing.assert_close(prev[:, 7], predecessor)
+        torch.testing.assert_close(prev[:, 8:], actions[:, 7:-1])
 
 
 # ===================================================================
@@ -263,6 +322,135 @@ class TestForwardIncrementalMask:
 # ===================================================================
 
 class TestEvaluator:
+    class _SpyModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.tokenizer = SimpleNamespace(eval_mode="mean")
+            self.calls = []
+
+        def forward_sequence(
+            self,
+            obs,
+            prev_actions,
+            current_actions,
+            **kwargs,
+        ):
+            self.calls.append({
+                "prev_actions": prev_actions.detach().clone(),
+                "current_actions": current_actions.detach().clone(),
+                **{
+                    key: value.detach().clone() if torch.is_tensor(value) else value
+                    for key, value in kwargs.items()
+                },
+            })
+            return SimpleNamespace(
+                reward_pred_seq=torch.zeros(
+                    obs.shape[:2], device=obs.device, dtype=obs.dtype,
+                ),
+            )
+
+    @staticmethod
+    def _recurrent_loader(batch_size=2):
+        T = 36
+        items = []
+        for b in range(batch_size):
+            actions = torch.arange(T * 3, dtype=torch.float32).view(T, 3) + b * 1000
+            rewards = torch.arange(T, dtype=torch.float32) + b * 100
+            valid = torch.ones(T, dtype=torch.bool)
+            if b == 0:
+                valid[:7] = False
+            loss_mask = torch.zeros(T, dtype=torch.bool)
+            loss_mask[20:36] = True
+            items.append({
+                "obs": torch.zeros(T, 3, 2, 2),
+                "action": actions,
+                "reward": rewards,
+                "predecessor_action": torch.tensor([99.0, 98.0, 97.0]),
+                "valid_step": valid,
+                "loss_mask": loss_mask,
+            })
+        return DataLoader(items, batch_size=batch_size)
+
+    def test_recurrent_evaluation_scores_only_blind_targets_and_forwards_strict(self):
+        model = self._SpyModel()
+        evaluator = MaskedFactualEvaluator(
+            model,
+            torch.device("cpu"),
+            train_reward_mean=0.0,
+            observation_dropout_execution="pre_perception_skip",
+        )
+        loader = self._recurrent_loader()
+
+        result = evaluator.evaluate_horizon(
+            loader, warmup=4, mask_horizon=4, action_variant="correct",
+        )
+
+        assert len(model.calls) == 2
+        visible_call, masked_call = model.calls
+        keep = masked_call["observation_keep"]
+        assert keep[0, 7:24].all()
+        assert keep[1, :24].all()
+        assert not keep[0, :7].any()
+        assert (~keep[:, 24:28]).all()
+        assert keep[:, 28:].all()
+        assert masked_call["observation_dropout_execution"] == "pre_perception_skip"
+        torch.testing.assert_close(
+            masked_call["valid_step"], next(iter(loader))["valid_step"],
+        )
+        assert result["transitions"] == 8
+        expected = torch.tensor(
+            [24.0, 25.0, 26.0, 27.0, 124.0, 125.0, 126.0, 127.0],
+        )
+        assert result["val_mse"] == pytest.approx(expected.square().mean().item())
+        assert result["val_mae"] == pytest.approx(expected.abs().mean().item())
+        assert result["baseline_mse"] == pytest.approx(expected.square().mean().item())
+        assert result["observation_dropout_execution"] == "pre_perception_skip"
+        assert result["skipped_valid_positions"] == 8
+        assert visible_call["observation_keep"][0, :7].sum().item() == 0
+
+    def test_post_perception_reports_masked_images_as_processed(self):
+        model = self._SpyModel()
+        evaluator = MaskedFactualEvaluator(
+            model,
+            torch.device("cpu"),
+            train_reward_mean=0.0,
+            observation_dropout_execution="post_perception",
+        )
+
+        result = evaluator.evaluate_horizon(
+            self._recurrent_loader(),
+            warmup=4,
+            mask_horizon=4,
+        )
+
+        assert result["visible_valid_positions"] < result["valid_input_positions"]
+        assert result["perceived_valid_positions"] == result["valid_input_positions"]
+        assert result["skipped_valid_positions"] == 0
+
+    @pytest.mark.parametrize("variant", ["zero", "shifted"])
+    def test_action_variant_changes_only_blind_target_positions(self, variant):
+        model = self._SpyModel()
+        evaluator = MaskedFactualEvaluator(
+            model, torch.device("cpu"), train_reward_mean=0.0,
+        )
+        loader = self._recurrent_loader()
+
+        evaluator.evaluate_horizon(
+            loader, warmup=4, mask_horizon=4, action_variant=variant,
+        )
+
+        visible_prev = model.calls[0]["prev_actions"]
+        masked_prev = model.calls[1]["prev_actions"]
+        torch.testing.assert_close(masked_prev[:, :24], visible_prev[:, :24])
+        torch.testing.assert_close(masked_prev[:, 28:], visible_prev[:, 28:])
+        if variant == "zero":
+            assert not masked_prev[:, 24:28].any()
+        else:
+            torch.testing.assert_close(
+                masked_prev[:, 24:28],
+                model.calls[1]["current_actions"][:, 24:28],
+            )
+
     def test_evaluator_returns_per_horizon_results(self):
         model = ReducedWorldModel(action_dim=3, tokenizer_eval_mode="mean")
         model.eval()
@@ -575,13 +763,40 @@ class TestCLIImports:
         """The evaluate_masked_dynamics.py script imports successfully and
         reuses build_protocol_loaders / reward_mean from evaluate_checkpoint."""
         import importlib.util
-        script_path = Path(__file__).resolve().parent.parent.parent / "scripts" / "evaluate_masked_dynamics.py"
+        script_path = (
+            Path(__file__).resolve().parent.parent.parent / "scripts" / "evaluation"
+            / "evaluate_masked_dynamics.py"
+        )
         assert script_path.exists()
         spec = importlib.util.spec_from_file_location("_emd", script_path)
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
         assert hasattr(mod, "build_protocol_loaders")
         assert hasattr(mod, "reward_mean")
+        assert hasattr(mod, "_resolve_recurrent_layout")
+
+    def test_cli_resolves_sru_burn_in_from_checkpoint_config(self):
+        import importlib.util
+        from rwm.config.experiment_config import ExperimentConfig, TemporalConfig
+
+        script_path = (
+            Path(__file__).resolve().parent.parent.parent / "scripts" / "evaluation"
+            / "evaluate_masked_dynamics.py"
+        )
+        spec = importlib.util.spec_from_file_location("_emd_layout", script_path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+
+        cfg = ExperimentConfig(
+            temporal=TemporalConfig(
+                backend="minimal_sru",
+                sru_burn_in_steps=20,
+            ),
+        )
+        assert mod._resolve_recurrent_layout(cfg) == ("minimal_sru", True, 20)
+        assert mod._resolve_recurrent_layout({}) == (
+            "causal_transformer", False, 0,
+        )
 
     def test_refuse_overwrite_logic(self, tmp_path):
         """Refuse-overwrite logic works when main() is called with an existing path."""
@@ -590,7 +805,10 @@ class TestCLIImports:
         out_path.write_text("{}")
         # Patch sys.argv so main() sees the existing output path
         import importlib.util
-        script_path = Path(__file__).resolve().parent.parent.parent / "scripts" / "evaluate_masked_dynamics.py"
+        script_path = (
+            Path(__file__).resolve().parent.parent.parent / "scripts" / "evaluation"
+            / "evaluate_masked_dynamics.py"
+        )
         spec = importlib.util.spec_from_file_location("_emd2", script_path)
         mod = importlib.util.module_from_spec(spec)
         # Test the refusl logic directly by calling argparse

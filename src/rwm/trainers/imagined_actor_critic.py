@@ -151,6 +151,9 @@ class ImaginedACTrainer:
         for p in self.model.parameters():
             p.requires_grad_(False)
 
+        # Detect SRU backend.
+        self._is_sru = getattr(self.model, "_temporal_backend", "causal_transformer") == "minimal_sru"
+
         # Modules.
         self.imag = ImaginationRollout(self.model).to(self.device)
         ac_full_cfg = _ACConfig(
@@ -169,6 +172,7 @@ class ImaginedACTrainer:
         self._global_step = 0
         self._metrics_log: List[Dict[str, Any]] = []
         self._anchor_info: Dict[str, Optional[str]] = {"path": None, "hash": None}
+        self._data_provenance: Dict[str, Any] = {}
         self._probe_batch = probe_batch
         self._step_rng = torch.Generator(device="cpu")
         if seed is not None:
@@ -185,14 +189,67 @@ class ImaginedACTrainer:
                      ) -> Tuple[Tensor, Tensor, Tensor]:
         """Extract warmup observations from a dataset batch.
 
+        Causal path:
+            Takes the first ``ws`` positions from the batch.
+
+        SRU path:
+            Takes all valid burn-in positions followed by the first ``ws``
+            target positions — a contiguous window from position 0 through
+            ``first_target + ws - 1`` (or ``T_total``, whichever is smaller).
+
+            * Left-padding (``valid_step=False``) is included but the SRU
+              holds ``z`` unchanged.
+            * Every valid burn-in observation is visible.
+            * ``predecessor_action`` is applied at the first valid position.
+            * Each later position receives the preceding real action.
+            * The first target position receives the final burn-in action.
+
         Returns ``(obs, prev_actions, current_actions)`` each shaped
-        ``(B, ws, ...)``.
+        ``(B, T_warm, ...)`` where T_warm ≤ ``first_target + ws``.
         """
         if ws is None:
             ws = self.cfg.warmup_steps
         B = batch["obs"].shape[0]
         device = self.device
 
+        if self._is_sru and "valid_step" in batch:
+            valid_step = batch["valid_step"].to(device)
+            loss_mask = batch.get("loss_mask")
+            T_total = batch["obs"].shape[1]
+            obs_all = batch["obs"].to(device, non_blocking=True)
+            act_all = batch["action"].to(device, non_blocking=True)
+
+            # First target position (loss_mask goes True for target).
+            if loss_mask is not None:
+                loss_mask_b = loss_mask.to(device)
+                first_target = loss_mask_b.long().argmax(dim=1)  # (B,)
+            else:
+                first_target = valid_step.long().argmax(dim=1)
+            first_valid = valid_step.long().argmax(dim=1)  # (B,)
+
+            # T_warm: from position 0 through first_target + ws - 1 (clamped).
+            T_warm = first_target + ws
+            T_warm = T_total if T_warm.max() > T_total else T_warm  # keep per-sample
+
+            # Handle variable per-sample T_warm (due to episode boundary).
+            T_warm_v = int(T_warm.max().item()) if T_warm.numel() > 1 else int(T_warm.item())
+            T_warm_v = min(T_warm_v, T_total)
+
+            obs = obs_all[:, :T_warm_v]
+            act_warm = act_all[:, :T_warm_v]
+
+            pred = batch["predecessor_action"].to(device, non_blocking=True)
+
+            prev_actions = torch.zeros(B, T_warm_v, ACTION_DIM, device=device)
+            if T_warm_v > 1:
+                prev_actions[:, 1:] = act_warm[:, :T_warm_v - 1]
+            for b in range(B):
+                fv = int(first_valid[b].item())
+                if fv < T_warm_v:
+                    prev_actions[b, fv] = pred[b]
+            return obs, prev_actions, act_warm
+
+        # Standard (causal): take first ws positions.
         obs = batch["obs"][:, :ws, :, :, :].to(device, non_blocking=True)
         act = batch["action"][:, :ws, :].to(device, non_blocking=True)
         pred = batch["predecessor_action"].to(device, non_blocking=True)
@@ -244,6 +301,7 @@ class ImaginedACTrainer:
         z_t = warmup_state.current_belief
         history = warmup_state.history
         lengths = warmup_state.lengths
+        curr_z = z_t if warmup_state.is_sru else None
 
         states = torch.empty(B, H, D, device=device)
         actions = torch.empty(B, H, ACTION_DIM, device=device)
@@ -261,7 +319,11 @@ class ImaginedACTrainer:
             actions[:, h] = a_t
             rewards[:, h] = r_t.squeeze(-1)
 
-            history, lengths, z_t = self.imag.advance(history, lengths, a_t)
+            history, lengths, z_t = self.imag.advance(
+                history, lengths, a_t, temporal_state=curr_z,
+            )
+            if curr_z is not None:
+                curr_z = z_t  # SRU: z_t IS the next recurrent state
 
         return states, actions, rewards, z_t
 
@@ -292,8 +354,11 @@ class ImaginedACTrainer:
         device = self.device
 
         obs, prev_actions, current_actions = self._prep_warmup(batch)
+        vs_warm = (batch["valid_step"][:, :obs.shape[1]].to(self.device)
+                   if self._is_sru and "valid_step" in batch else None)
         warmup_state = self.imag.warmup(
             obs, prev_actions, current_actions, force_keep_input=True,
+            valid_step=vs_warm,
         )
 
         states, actions_t, rewards_t, z_H = self.generate_trajectory(
@@ -387,8 +452,11 @@ class ImaginedACTrainer:
         for H in horizons:
             ws = self.cfg.warmup_steps
             obs, prev_actions, current_actions = self._prep_warmup(batch, ws=ws)
+            vs_warm = (batch["valid_step"][:, :obs.shape[1]].to(self.device)
+                       if self._is_sru and "valid_step" in batch else None)
             warmup_state = self.imag.warmup(
                 obs, prev_actions, current_actions, force_keep_input=True,
+                valid_step=vs_warm,
             )
 
             states, actions_t, rewards_t, z_H = self.generate_trajectory(
@@ -535,6 +603,7 @@ class ImaginedACTrainer:
                 "factual_warmup_transitions_reused": warmup_transitions,
                 "elapsed_s": elapsed_s,
                 "peak_gpu_gb": peak_gpu_gb,
+                "data_provenance": self._data_provenance,
             }, f, indent=2, sort_keys=True)
 
     def _save_checkpoint(self, step: int) -> None:
@@ -560,6 +629,7 @@ class ImaginedACTrainer:
             "config": self.cfg.to_dict(),
             "actor_critic_config": dataclasses.asdict(self.ac.cfg),
             "anchor": self._anchor_info,
+            "data_provenance": self._data_provenance,
         }, ckpt_path)
 
     def load_actor_critic_checkpoint(self, path: Path) -> int:
@@ -574,6 +644,7 @@ class ImaginedACTrainer:
         self.ac._critic_optim.load_state_dict(data["optimizer"]["critic_optim"])
         self._global_step = int(data.get("global_step", data["step"]))
         self._anchor_info = data.get("anchor", self._anchor_info)
+        self._data_provenance = data.get("data_provenance", self._data_provenance)
         return self._global_step
 
     def _save_anchor_info(self) -> None:
@@ -586,3 +657,59 @@ class ImaginedACTrainer:
         path = self.out_dir / "anchor_checkpoint.txt"
         with open(path, "w") as f:
             f.write(f"path: {ckpt_path}\nhash: {ckpt_hash}\n")
+
+    def set_data_provenance(self, provenance: Dict[str, Any]) -> None:
+        """Attach the exact factual file split used to construct dream starts."""
+        self._data_provenance = dict(provenance)
+
+
+def load_ac_from_checkpoint(
+    model: ReducedWorldModel,
+    ac_checkpoint_path: Path,
+    device: torch.device,
+    actor_critic_config: Optional[_ACConfig] = None,
+) -> "ActorCritic":
+    """Load an Actor-Critic checkpoint into a fresh AC module without side effects.
+
+    Unlike ``ImaginedACTrainer.load_actor_critic_checkpoint``, this function
+    does not create any output directory or require a DataLoader.
+    """
+    from rwm.models.actor_critic import ActorCritic as _ActorCritic
+    from rwm.config.experiment_config import ActorCriticConfig as _ACConfigDefault
+
+    cfg = actor_critic_config or _ACConfigDefault()
+    ac = _ActorCritic(model, cfg).to(device)
+    data = torch.load(ac_checkpoint_path, map_location=device, weights_only=False)
+    if data.get("kind") != "imagined_actor_critic":
+        raise ValueError(f"not an imagined Actor-Critic checkpoint: {ac_checkpoint_path}")
+    ac.actor.load_state_dict(data["actor_critic"]["actor"])
+    ac.critic.load_state_dict(data["actor_critic"]["critic"])
+    ac.target_critic.load_state_dict(data["actor_critic"]["target_critic"])
+    if "optimizer" in data:
+        if "actor_optim" in data["optimizer"]:
+            ac._actor_optim.load_state_dict(data["optimizer"]["actor_optim"])
+        if "critic_optim" in data["optimizer"]:
+            ac._critic_optim.load_state_dict(data["optimizer"]["critic_optim"])
+    return ac
+
+
+def validate_ac_anchor_checkpoint(
+    ac_checkpoint_path: Path,
+    expected_anchor_hash: str,
+) -> None:
+    """Reject Actor-Critic state trained from a different world-model anchor."""
+    data = torch.load(ac_checkpoint_path, map_location="cpu", weights_only=False)
+    if data.get("kind") != "imagined_actor_critic":
+        raise ValueError(
+            f"not an imagined Actor-Critic checkpoint: {ac_checkpoint_path}"
+        )
+    recorded = data.get("anchor", {}).get("hash")
+    if not recorded:
+        raise ValueError(
+            "Stage 6.1 requires Actor-Critic checkpoint anchor provenance"
+        )
+    if recorded != expected_anchor_hash:
+        raise ValueError(
+            "Actor-Critic/world-model anchor mismatch: "
+            f"AC records {recorded}, selected anchor is {expected_anchor_hash}"
+        )

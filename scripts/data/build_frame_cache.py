@@ -5,11 +5,11 @@ Transforms each episode's uint8 observations to (T, 3, 64, 64) float32
 tensors once, saving repeated NPZ decompression and PIL resize in training.
 
 Usage:
-    python scripts/build_frame_cache.py                         # build default cache
-    python scripts/build_frame_cache.py --cache-dir /custom/path
-    python scripts/build_frame_cache.py --dry-run               # report what would be cached
-    python scripts/build_frame_cache.py --validate              # check integrity
-    python scripts/build_frame_cache.py --data-root data/rollouts/rwm_deterministic
+    python scripts/data/build_frame_cache.py                         # build default cache
+    python scripts/data/build_frame_cache.py --cache-dir /custom/path
+    python scripts/data/build_frame_cache.py --dry-run               # report what would be cached
+    python scripts/data/build_frame_cache.py --validate              # check integrity
+    python scripts/data/build_frame_cache.py --data-root data/rollouts/rwm_deterministic
 """
 
 import argparse

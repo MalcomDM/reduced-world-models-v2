@@ -8,7 +8,7 @@ contribution of previous-action context.
 
 Usage::
 
-    python scripts/evaluate_masked_dynamics.py \\
+    python scripts/evaluation/evaluate_masked_dynamics.py \\
         --checkpoint runs/component_refinement/causal_transformer/05_k_ablation/learned_k8_seed42/checkpoint_best.pt \\
         --data-split-seed 42 --cache-dir data/cache/rollout_frames_v1 \\
         --out runs/component_refinement/causal_transformer/07_masked_factual_dynamics/seed42.json
@@ -37,6 +37,7 @@ _eval_ckpt = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_eval_ckpt)
 build_protocol_loaders = _eval_ckpt.build_protocol_loaders
 reward_mean = _eval_ckpt.reward_mean
+_config_value = _eval_ckpt._config_value
 
 
 DATA_ROOT = Path("data/rollouts/rwm_deterministic/scenario_0")
@@ -53,6 +54,40 @@ def _perception_value(config: Any, name: str, default: Any) -> Any:
     return getattr(pc, name, default)
 
 
+def _temporal_mask_value(config: Any, name: str, default: Any) -> Any:
+    if config is None:
+        return default
+    training = (
+        config.get("training")
+        if isinstance(config, dict)
+        else getattr(config, "training", None)
+    )
+    if training is None:
+        return default
+    temporal_mask = (
+        training.get("temporal_mask")
+        if isinstance(training, dict)
+        else getattr(training, "temporal_mask", None)
+    )
+    if temporal_mask is None:
+        return default
+    if isinstance(temporal_mask, dict):
+        return temporal_mask.get(name, default)
+    return getattr(temporal_mask, name, default)
+
+
+def _resolve_recurrent_layout(config: Any) -> tuple[str, bool, int]:
+    temporal = _config_value(config, "temporal", None)
+    backend = _config_value(temporal, "backend", "causal_transformer")
+    recurrent_context = backend == "minimal_sru"
+    burn_in_steps = (
+        int(_config_value(temporal, "sru_burn_in_steps", 0))
+        if recurrent_context
+        else 0
+    )
+    return backend, recurrent_context, burn_in_steps
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Masked factual dynamics evaluation (Stage 2.5D).",
@@ -67,6 +102,19 @@ def main() -> None:
     parser.add_argument("--sequence-len", type=int, default=16)
     parser.add_argument("--max-val-windows", type=int, default=256)
     parser.add_argument("--warmup", type=int, default=4)
+    parser.add_argument(
+        "--mask-horizons",
+        type=int,
+        nargs="+",
+        default=[1, 2, 4, 8, 12],
+        help="Target-relative blind horizons (default: 1 2 4 8 12).",
+    )
+    parser.add_argument(
+        "--observation-dropout-execution",
+        choices=("post_perception", "pre_perception_skip"),
+        default=None,
+        help="Runtime execution override; defaults to the checkpoint policy.",
+    )
     args = parser.parse_args()
 
     out_path = Path(args.out)
@@ -77,6 +125,11 @@ def main() -> None:
     ckpt = load_checkpoint(args.checkpoint)
     config = ckpt.get("config")
     saved_policy = _perception_value(config, "tokenizer_eval_mode", "sample")
+    saved_execution = _temporal_mask_value(
+        config, "observation_dropout_execution", "post_perception",
+    )
+    runtime_execution = args.observation_dropout_execution or saved_execution
+    backend, recurrent_context, burn_in_steps = _resolve_recurrent_layout(config)
     data_split_seed = args.data_split_seed if args.data_split_seed is not None else int(
         config.get("seed", 42) if isinstance(config, dict) else getattr(config, "seed", 42)
     )
@@ -92,23 +145,35 @@ def main() -> None:
     model.eval()
     runtime_policy = model.tokenizer.eval_mode
     print(f"Tokenizer policy: saved={saved_policy}, runtime={runtime_policy}")
+    print(
+        "Dropout execution: "
+        f"saved={saved_execution}, runtime={runtime_execution}"
+    )
 
     # Build data loaders (same split as original training)
     train_loader, val_loader, data_info = build_protocol_loaders(
         args.data_root, sequence_len=args.sequence_len, batch_size=args.batch_size,
         max_val_windows=args.max_val_windows, data_split_seed=data_split_seed,
         cache_dir=args.cache_dir,
+        recurrent_context=recurrent_context,
+        burn_in_steps=burn_in_steps,
     )
     train_mean = reward_mean(train_loader)
     print(f"Train reward mean: {train_mean:.6f}, val windows: {data_info['val_windows']}")
 
     # Run masked evaluation
-    evaluator = MaskedFactualEvaluator(model, device, train_reward_mean=train_mean, tokenizer_eval_mode="mean")
+    evaluator = MaskedFactualEvaluator(
+        model,
+        device,
+        train_reward_mean=train_mean,
+        tokenizer_eval_mode="mean",
+        observation_dropout_execution=runtime_execution,
+    )
     start = time.time()
     summary = evaluator.evaluate(
         val_loader,
         warmup=args.warmup,
-        mask_horizons=(1, 2, 4, 8, 16),
+        mask_horizons=tuple(args.mask_horizons),
         action_variants=("correct", "zero", "shifted"),
     )
     elapsed = time.time() - start
@@ -121,11 +186,16 @@ def main() -> None:
         "data_split_seed": data_split_seed,
         "batch_size": args.batch_size,
         "sequence_len": args.sequence_len,
+        "temporal_backend": backend,
         "max_val_windows": args.max_val_windows,
         "warmup": args.warmup,
+        "mask_horizons": args.mask_horizons,
         "train_reward_mean": train_mean,
         "tokenizer_policy_saved": saved_policy,
         "tokenizer_policy_runtime": runtime_policy,
+        "observation_dropout_execution_saved": saved_execution,
+        "observation_dropout_execution_runtime": runtime_execution,
+        "mask_anchor": "loss_mask",
         "elapsed_s": elapsed,
         **data_info,
         **summary,

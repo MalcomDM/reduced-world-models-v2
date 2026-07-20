@@ -57,28 +57,87 @@ def train_world_model_loop(
     n_val = max(1, int(len(all_files) * val_ratio))
     train_files, val_files = all_files[n_val:], all_files[:n_val]
 
-    from rwm.data.rollout_dataset import RolloutDataset
-    train_ds = RolloutDataset.from_file_list(
-        train_files, sequence_len=sequence_len, image_size=image_size,
-        cache_dir=cache_dir,
-    )
-    val_ds = RolloutDataset.from_file_list(
-        val_files, sequence_len=sequence_len, image_size=image_size,
-        cache_dir=cache_dir,
-    )
+    from rwm.config.experiment_config import TemporalConfig
+    temporal_cfg: TemporalConfig = config.temporal if config is not None else TemporalConfig()
+    is_sru = temporal_cfg.backend == "minimal_sru"
+    burn_in_steps = temporal_cfg.sru_burn_in_steps if is_sru else 0
+    is_seq = is_sru and temporal_cfg.sru_training_mode == "sequential_tbptt"
+    is_mb = is_sru and temporal_cfg.sru_training_mode == "random_macroblock_tbptt"
 
-    nw = config.data.num_workers if config is not None else NUM_WORKERS
-    pin_memory = config.data.pin_memory if config is not None else PIN_MEMORY
-    train_loader = DataLoader(
-        train_ds, batch_size=batch_size, shuffle=True,
-        drop_last=True, num_workers=nw, pin_memory=pin_memory,
-        persistent_workers=nw > 0,
-    )
-    val_loader = DataLoader(
-        val_ds, batch_size=batch_size, shuffle=False,
-        drop_last=False, num_workers=nw, pin_memory=pin_memory,
-        persistent_workers=nw > 0,
-    )
+    # Validation always uses random-burn-in SRU or causal.
+    from rwm.data.rollout_dataset import RolloutDataset
+
+    if is_mb:
+        from rwm.data.macroblock_dataset import MacroblockDataset
+        train_ds = MacroblockDataset(
+            train_files, burn_in_steps=temporal_cfg.sru_burn_in_steps,
+            macroblock_target_steps=temporal_cfg.macroblock_target_steps,
+            image_size=image_size, cache_dir=cache_dir,
+        )
+        train_loader = DataLoader(
+            train_ds, batch_size=batch_size, shuffle=True,
+            # Macroblocks partition each episode's target positions.  Retain
+            # the final partial batch so one pass covers every target once.
+            drop_last=False, num_workers=0,
+        )
+        val_ds = RolloutDataset.from_file_list(
+            val_files, sequence_len=sequence_len, image_size=image_size,
+            cache_dir=cache_dir,
+            recurrent_context=is_sru, burn_in_steps=burn_in_steps,
+        )
+        nw = config.data.num_workers if config is not None else NUM_WORKERS
+        pin_memory = config.data.pin_memory if config is not None else PIN_MEMORY
+        val_loader = DataLoader(
+            val_ds, batch_size=batch_size, shuffle=False,
+            drop_last=False, num_workers=nw, pin_memory=pin_memory,
+            persistent_workers=nw > 0,
+        )
+    elif is_seq:
+        from rwm.data.sequential_episode_dataset import MultiStreamSequentialDataset
+        train_ds = MultiStreamSequentialDataset(
+            train_files, chunk_len=temporal_cfg.tbptt_steps,
+            batch_size=batch_size, image_size=image_size,
+            cache_dir=cache_dir,
+        )
+        train_loader = DataLoader(train_ds, batch_size=None, num_workers=0)
+        val_ds = RolloutDataset.from_file_list(
+            val_files, sequence_len=sequence_len, image_size=image_size,
+            cache_dir=cache_dir,
+            recurrent_context=is_sru, burn_in_steps=burn_in_steps,
+        )
+        nw = config.data.num_workers if config is not None else NUM_WORKERS
+        pin_memory = config.data.pin_memory if config is not None else PIN_MEMORY
+        val_loader = DataLoader(
+            val_ds, batch_size=batch_size, shuffle=False,
+            drop_last=False, num_workers=nw, pin_memory=pin_memory,
+            persistent_workers=nw > 0,
+        )
+    else:
+        train_ds = RolloutDataset.from_file_list(
+            train_files, sequence_len=sequence_len, image_size=image_size,
+            cache_dir=cache_dir,
+            recurrent_context=is_sru,
+            burn_in_steps=burn_in_steps,
+        )
+        val_ds = RolloutDataset.from_file_list(
+            val_files, sequence_len=sequence_len, image_size=image_size,
+            cache_dir=cache_dir,
+            recurrent_context=is_sru,
+            burn_in_steps=burn_in_steps,
+        )
+
+        nw = config.data.num_workers if config is not None else NUM_WORKERS
+        pin_memory = config.data.pin_memory if config is not None else PIN_MEMORY
+        train_loader = DataLoader(
+            train_ds, batch_size=batch_size, shuffle=True,
+            drop_last=True, num_workers=nw, pin_memory=pin_memory,
+            persistent_workers=nw > 0,
+        )
+        val_loader = DataLoader(
+            val_ds, batch_size=batch_size, shuffle=False,
+            drop_last=False, num_workers=nw, pin_memory=pin_memory,
+            persistent_workers=nw > 0,
+        )
 
     # Dataset manifest
     manifest_ref: Optional[str] = None

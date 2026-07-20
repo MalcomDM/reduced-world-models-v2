@@ -24,11 +24,14 @@ class WorldModelOutput(NamedTuple):
     reward_pred:   ``(B, 1)`` — predicted immediate reward r_{{t+1}}.
     mask_soft:     ``(B, N)`` — soft Top-K mask over patch tokens.
     indices:       ``(B, K)`` — selected patch token indices.
-    history:       ``(B, T', input_dim)`` — updated temporal history buffer.
+    history:       ``(B, T', input_dim)`` — updated temporal history buffer
+                   (causal backend) or placeholder ``(B, 1, input_dim)`` (SRU).
     lengths:       ``(B,)`` — valid lengths in ``history``.
     tok_mu:        ``(B, T, P, D)`` or ``(B, P, D)`` or ``None`` — tokenizer mean
                    (full sequence: ``(B, T, P, D)``; single frame: ``(B, P, D)``).
     tok_logvar:    Same shape as ``tok_mu`` — tokenizer log-variance.
+    temporal_state: ``(B, world_state_dim)`` or ``None`` — SRU recurrent state
+                   for the next incremental call.  ``None`` in causal mode.
     """
     world_state: Tensor
     reward_pred: Tensor
@@ -39,6 +42,7 @@ class WorldModelOutput(NamedTuple):
     tok_mu: Optional[Tensor] = None
     tok_logvar: Optional[Tensor] = None
     reward_pred_seq: Optional[Tensor] = None  # (B, T) per-step predictions from forward_sequence
+    temporal_state: Optional[Tensor] = None  # SRU: (B, D); causal: None
 
 
 # ---------------------------------------------------------------------------
@@ -128,6 +132,14 @@ class RolloutSample(TypedDict):
     training so the first belief is conditioned on the correct previous
     action rather than always zeros.
 
+    In SRU burn-in mode, the window is larger and includes ``valid_step`` and
+    ``loss_mask``:
+
+        obs, action, reward, done:   shape (total_len, ...)
+        valid_step:                  shape (total_len,)  bool; False=padding
+        loss_mask:                   shape (total_len,)  bool; True=target position
+        predecessor_action:          action at the first non-padding position - 1
+
     Reference: `docs/contracts/transition_contract.md`
     """
     obs: Tensor         # shape (T, C, H, W)
@@ -135,6 +147,8 @@ class RolloutSample(TypedDict):
     reward: Tensor      # shape (T,)
     done: Tensor        # shape (T,)  bool
     predecessor_action: Tensor  # shape (A,); zeros only at a true episode start
+    valid_step: Optional[Tensor] = None  # shape (T,) bool; SRU burn-in mode only
+    loss_mask: Optional[Tensor] = None  # shape (T,) bool; True=target, False=burn-in/padding
 
 
 class ProbeSet(TypedDict):

@@ -3,14 +3,19 @@
 
 Usage::
 
-    # Evaluate trained checkpoint
-    python scripts/evaluate_real_env.py \\
-        --checkpoint runs/imagined_actor_critic/stage5_3_train/checkpoints/ac_checkpoint_2000.pt \\
-        --anchor runs/component_refinement/causal_transformer/08_masked_reward_anchor/seed42/checkpoint_best.pt \\
-        --out runs/imagined_actor_critic/stage5_3_eval
+    # Evaluate trained checkpoint (causal or SRU)
+    python scripts/evaluation/evaluate_real_env.py \\
+        --checkpoint runs/imagined_actor_critic/.../checkpoints/ac_checkpoint_2000.pt \\
+        --anchor runs/.../checkpoint_best.pt \\
+        --out runs/imagined_actor_critic/.../seed42/evaluation/actor
 
     # Zero-action baseline
-    python scripts/evaluate_real_env.py --baseline --out runs/imagined_actor_critic/stage5_3_baseline
+    python scripts/evaluation/evaluate_real_env.py --baseline \\
+        --out runs/imagined_actor_critic/.../seed42/evaluation/zero
+
+    # Deterministic random-action baseline
+    python scripts/evaluation/evaluate_real_env.py --random-baseline \\
+        --out runs/imagined_actor_critic/.../seed42/evaluation/random
 """
 
 from __future__ import annotations
@@ -34,9 +39,11 @@ from rwm.evaluation.real_env_evaluator import (
     compute_reward_mse_mae,
     mean_action,
     run_episode,
+    run_random_baseline,
     run_zero_baseline,
     save_episode_csv,
     save_episode_json,
+    verify_actor_checkpoint_anchor,
 )
 from rwm.evaluation.schema import Split, load_seed_manifest
 from rwm.trainers.imagined_actor_critic import ImaginedACTrainer
@@ -101,6 +108,10 @@ def main() -> None:
         help="Run zero-action baseline instead of loading a policy",
     )
     parser.add_argument(
+        "--random-baseline", action="store_true",
+        help="Run deterministic random-action baseline instead of loading a policy",
+    )
+    parser.add_argument(
         "--seeds", type=int, nargs="+", default=None,
         help="Dev seeds to evaluate (default: first three from manifest)",
     )
@@ -118,8 +129,10 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    if not args.baseline and (not args.checkpoint or not args.anchor):
-        parser.error("--checkpoint and --anchor are required unless --baseline is set")
+    if args.baseline and args.random_baseline:
+        parser.error("--baseline and --random-baseline are mutually exclusive")
+    if not args.baseline and not args.random_baseline and (not args.checkpoint or not args.anchor):
+        parser.error("--checkpoint and --anchor are required unless --baseline or --random-baseline is set")
 
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -160,6 +173,35 @@ def main() -> None:
                             "terminated": ep.terminated,
                             "truncated": ep.truncated}
                    for s, ep in results.items()}
+        summary["policy"] = "zero_action"
+        summary["seed_manifest_path"] = str(manifest_path.resolve())
+        summary["seed_manifest_hash"] = _file_hash(manifest_path)
+        with open(out_dir / "summary.json", "w") as f:
+            json.dump(summary, f, indent=2, sort_keys=True)
+        print(f"\nDone. Output in {out_dir}")
+        return
+
+    if args.random_baseline:
+        print("Running random-action baseline...")
+        results = {}
+        policy_name = "random_action"
+        for seed in seeds:
+            print(f"  Seed {seed}...")
+            ep = run_random_baseline(seed, max_steps=args.max_steps,
+                                     manifest=manifest, render_mode=render_mode)
+            results[seed] = ep
+            csv_path = out_dir / f"episode_seed{seed}.csv"
+            json_path = out_dir / f"episode_seed{seed}.json"
+            save_episode_csv(ep, csv_path)
+            save_episode_json(ep, json_path)
+            print(f"    Steps: {ep.n_steps}, Reward: {ep.cumulative_reward:.2f}")
+        summary = {str(s): {"cumulative_reward": ep.cumulative_reward,
+                            "n_steps": ep.n_steps,
+                            "terminated": ep.terminated,
+                            "truncated": ep.truncated,
+                            "rng_seed": ep.rng_seed}
+                   for s, ep in results.items()}
+        summary["policy"] = "random_action"
         summary["seed_manifest_path"] = str(manifest_path.resolve())
         summary["seed_manifest_hash"] = _file_hash(manifest_path)
         with open(out_dir / "summary.json", "w") as f:
@@ -170,19 +212,23 @@ def main() -> None:
     # Load model and AC.
     anchor_path = Path(args.anchor)
     ckpt_path = Path(args.checkpoint)
-    anchor_hash = _file_hash(anchor_path)
-    print(f"Anchor: {anchor_path} (hash: {anchor_hash})")
+    try:
+        anchor_file_hash, anchor_verified = verify_actor_checkpoint_anchor(
+            anchor_path, ckpt_path,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
+
+    print(f"Anchor: {anchor_path} (hash: {anchor_file_hash})")
     print(f"Checkpoint: {ckpt_path}")
 
     model, ac = _load_model_and_ac(anchor_path, ckpt_path, device)
     print(f"Model and Actor-Critic loaded on {device}")
 
-    # Verify anchor hash.
-    wm_hash_now = _file_hash(anchor_path)
-    assert wm_hash_now == anchor_hash, (
-        f"Anchor hash mismatch: {wm_hash_now} != {anchor_hash}"
-    )
-    print(f"Anchor hash verified: {anchor_hash}")
+    if anchor_verified:
+        print(f"Anchor hash verified: {anchor_file_hash}")
+    else:
+        print("WARNING: continuing with an unverified legacy anchor")
 
     # Run evaluation.
     results: dict = {}
@@ -214,8 +260,10 @@ def main() -> None:
                         "reward_mae": compute_reward_mse_mae(ep)[1],
                         "mean_action": mean_action(ep).tolist()}
                for s, ep in results.items()}
+    summary["policy"] = "actor"
     summary["anchor_path"] = str(anchor_path.resolve())
-    summary["anchor_hash"] = anchor_hash
+    summary["anchor_hash"] = anchor_file_hash
+    summary["anchor_verified"] = anchor_verified
     summary["checkpoint_path"] = str(ckpt_path.resolve())
     summary["seed_manifest_path"] = str(manifest_path.resolve())
     summary["seed_manifest_hash"] = _file_hash(manifest_path)

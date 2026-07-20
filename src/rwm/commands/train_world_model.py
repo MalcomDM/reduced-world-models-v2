@@ -80,7 +80,7 @@ def train_world_model(
     cache_dir: Optional[Path] = typer.Option(
         None, file_okay=False, dir_okay=True,
         help="Path to frame cache (default: no cache). "
-             "Build with: python scripts/build_frame_cache.py",
+             "Build with: python scripts/data/build_frame_cache.py",
     ),
     reward_head_kind: str = typer.Option(
         "linear", help="Reward head architecture: 'linear' or 'nonlinear'",
@@ -115,6 +115,30 @@ def train_world_model(
     temporal_mask_ramp_epochs: int = typer.Option(
         2, help="Epochs over which mask probability ramps from 0 to target",
     ),
+    observation_dropout_execution: str = typer.Option(
+        "post_perception",
+        help="Observational dropout execution: 'post_perception' (default) or 'pre_perception_skip'",
+    ),
+    temporal_backend: str = typer.Option(
+        "causal_transformer",
+        help="Temporal backbone: 'causal_transformer' (default) or 'minimal_sru'",
+    ),
+    sru_burn_in_steps: int = typer.Option(
+        20, help="Number of burn-in context steps for SRU (ignored in causal mode)",
+    ),
+    sru_carry_bias_init: float = typer.Option(
+        1.0, help="Initial carry gate bias for SRU cell (ignored in causal mode)",
+    ),
+    sru_training_mode: str = typer.Option(
+        "random_burn_in",
+        help="SRU training mode: 'random_burn_in' (default) or 'sequential_tbptt'",
+    ),
+    tbptt_steps: int = typer.Option(
+        16, help="Truncated BPTT chunk length for sequential_tbptt or random_macroblock_tbptt",
+    ),
+    macroblock_target_steps: int = typer.Option(
+        64, help="Target steps per macroblock for random_macroblock_tbptt mode",
+    ),
 ):
     """Train a ReducedWorldModel on rollout data with held-out validation.
 
@@ -147,8 +171,14 @@ def train_world_model(
             cache_dir=str(cache_dir.resolve()) if cache_dir is not None else "",
         ),
         temporal=TemporalConfig(
+            backend=temporal_backend,
             seq_len=sequence_len,
             warmup_steps=warmup_steps,
+            sru_burn_in_steps=sru_burn_in_steps,
+            sru_carry_bias_init=sru_carry_bias_init,
+            sru_training_mode=sru_training_mode,
+            tbptt_steps=tbptt_steps,
+            macroblock_target_steps=macroblock_target_steps,
         ),
         perception=PerceptionConfig(
             k=selection_k,
@@ -170,6 +200,7 @@ def train_world_model(
                 horizons=[int(x) for x in temporal_mask_horizons.split(",")],
                 target_mask_probability=temporal_mask_probability,
                 ramp_epochs=temporal_mask_ramp_epochs,
+                observation_dropout_execution=observation_dropout_execution,
             ),
         ),
     )

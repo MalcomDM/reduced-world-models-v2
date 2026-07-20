@@ -7,18 +7,24 @@
 | Thesis direction and terminology | `Summary.md` | Concise research motivation; not an execution checklist. |
 | Architecture, timing, objectives, and gradient boundaries | `technical_definitions.md` | Canonical design contract. |
 | Rollout indexing and schema semantics | `contracts/transition_contract.md` | Canonical data contract; preserves historical bugs as labelled evidence. |
+| Optional latent replay semantics | `contracts/latent_memory_contract.md` | Canonical versioning, invalidation, gradient, sampling, and retention contract. |
 | Research hypotheses, evidence limits, performance audit, and ablations | `plans/architecture_validation_plan.md` | Canonical Stage 2.5 validation plan. |
 | Implementation order and completion history | `plans/implementation_plan.md` | Canonical engineering stage plan. |
+| Temporal-backend decision | `plans/sru_temporal_validation_plan.md` | Completed MinimalSRU S0–S6 validation and adoption record. |
+| Memory/replay validation | `plans/memory_replay_validation_plan.md` | Stage-7 hypotheses, invariants, matched controls, and advancement gates. |
 | Thesis-facing probe record | `evidence/theoretical_probes.md` | Concise claims, matched evidence, and limits. |
 | Detailed experiment evidence | `evidence/` | Reproducible experiment reports. |
+| MinimalSRU evidence lineage | `evidence/sru_temporal/` | Tracked S2–S6 reports; raw binary artifacts stay under ignored `runs/`. |
+| Joint-training evidence | `evidence/joint_training/` | Controlled shared-representation gates; raw checkpoints remain under ignored `runs/`. |
 | Run/config/checkpoint conventions | `protocols/experiment_artifacts.md` | Reproducibility and artifact contract. |
 
 When two documents appear to conflict, prefer this order:
 
 1. `technical_definitions.md` for current architectural semantics;
 2. `contracts/transition_contract.md` for dataset/indexing semantics;
-3. `plans/architecture_validation_plan.md` for whether a claim is experimentally established;
-4. `plans/implementation_plan.md` for execution sequence.
+3. `contracts/latent_memory_contract.md` for cached-state/replay semantics;
+4. `plans/architecture_validation_plan.md` for whether a claim is experimentally established;
+5. `plans/implementation_plan.md` for execution sequence.
 
 ## Stage Map
 
@@ -26,53 +32,32 @@ When two documents appear to conflict, prefer this order:
 |---|---|---|---|
 | Complete | 0 | Freeze data/timing contracts | Contract and regression tests. |
 | Complete | 0.5 | Reproducible experiment infrastructure | Structured runs, manifests, seeds, checkpoints. |
-| Complete | 1 | Active causal Transformer migration | Structured temporal API and regression coverage. |
-| Anchor complete | 2 | End-to-end factual reward prediction | Pipeline can overfit and exceeds the historical mean baseline. |
-| Next | 2.5A | Measurement foundation | Versioned seeded scenarios, fixed splits, full-episode evaluator, controlled action branches. |
-| Then | 2.5B | Correct and accelerate reward anchor | Correctness fixes preserve/match fixed-suite reward result. |
-| Then | 2.5C | Perception hypotheses | Retained mechanisms beat declared matched baselines. |
-| Then | 2.5D | Masked-dynamics hypothesis | Masked beliefs respond to branched actions and degrade gradually by horizon. |
-| Then | 3 | Trainable imagination engine | One correct, differentiable observed/masked transition interface. |
-| Then | 4 | Actor-Critic with frozen model | Policy/value mathematics and real evaluation work with stable beliefs. |
-| Then | 5 | Actor-Critic through imagination | Imagined gains correlate with real return. |
-| Then | 6 | Controlled upstream behavior gradients | Factual behavior pressure improves without predictive forgetting. |
-| Then | 7 | Progressive collection/replay | Improvement persists across data-collection cycles and unseen seeds. |
+| Complete | 1–2 | Factual reward-model pipeline | Held-out reward prediction and timing gates. |
+| Complete | 2.5A–D | Measurement and component refinement | Evaluation isolation, corrected gradients, perception ablations, masked dynamics. |
+| Complete | 3 | Trainable imagination engine | Correct observed/blind transition interface. |
+| Complete | 4 | Actor-Critic mathematics | Bounded actions, λ-returns, target Critic, freeze contracts. |
+| Complete | 5 | Frozen imagined Actor-Critic | Critic learns; real-environment evaluation works. |
+| Complete | SRU S0–S6 | Temporal-backend replacement | MinimalSRU passes reward, blind-dynamics, z-only imagination, and policy-parity gates. |
+| Complete (calibration deferred) | 6 | Safe ControllerTrunk + Critic boundary | Connectivity/predictive gates passed; the 500-update schedule needs gentler calibration after memory. |
+| Active next | 7 | Factual memory, latent cache, and wake–dream replay | Stratified replay beats an equal-budget uniform baseline and establishes a stronger behavioral control. |
+| Planned | 8 | Memory-informed upstream gradients and cycle calibration | Progressively open SRU/Actor/perception against the stronger Stage-7 baseline, then calibrate repeated cycles. |
+| Planned | 9 | Thesis ablations and interpretation | Each retained component has matched evidence or is labelled unproven. |
+| Planned | 10 | Final thesis evaluation | Multi-seed results under predeclared interaction and compute budgets. |
 
-## Immediate Work Boundary: Stage 2.5A
+## Immediate Work Boundary: Stage 6
 
-Stage 2.5A changes measurement and data provenance, not model learning. It must
-deliver:
+MinimalSRU is the selected backend on `main`; the causal baseline remains on
+`baseline/causal-transformer-stage5`. Stage 6.0 established the gradient audit.
+The final split-clean Stage-6.1 experiment preserved visible and masked
+prediction in both seeds. Its specific 500-update schedule missed
+real-return non-inferiority for seed 42, so it is not used during Stage 7.
+This does not reject the gradient boundary: Stage 8 will calibrate smaller,
+more frequent/interleaved updates against the stronger memory baseline.
 
-- a versioned rollout schema for newly collected data with seed, policy
-  provenance, collector configuration, and separate `terminated`/`truncated`;
-- immutable development, validation, and locked-test seed manifests;
-- a full-episode evaluator that counts each transition once;
-- a deterministic branch runner: replay a prefix on a fixed seed, branch into
-  specified action sequences, and verify reproduced prefix frames/rewards;
-- reusable attention instrumentation: score heatmap, hard Top-K overlay, and
-  within-selected-patch pooling weights;
-- regression tests for schema validation, deterministic replay, split isolation,
-  unique-transition accounting, and visualization tensor alignment.
-
-Existing Stage 2 data remains a historical anchor. New schema/data is not
-silently mixed with it; manifests state which schema version was used.
-
-## New Commands (Stage 2.5A)
-
-```
-rwm eval init-seeds <output> --dev-seeds ... --val-seeds ... --test-seeds ...
-rwm eval collect <manifest> <seed> --out-dir ... [--operator ...]
-rwm eval label <episode> --quality ... [--tags ...] [--operator ...] [--notes ...]
-rwm eval status <eval-dir>
-```
-
-## Module overview (Stage 2.5A)
-
-| Module | Purpose |
-|--------|---------|
-| `src/rwm/evaluation/schema.py` | Versioned rollout schema, seed manifest, episode metadata |
-| `src/rwm/evaluation/collector.py` | Evaluation-only rollout collector |
-| `src/rwm/evaluation/branch_runner.py` | Deterministic branch experiments |
-| `src/rwm/evaluation/episode_evaluator.py` | Full-episode evaluation (unique transitions) |
-| `src/rwm/evaluation/attention_trace.py` | Attention instrumentation and rendering |
-| `docs/protocols/evaluation_protocol.md` | Detailed collection/labeling/evaluation protocol |
+Stage 7 makes factual experience memory a central part of the learning cycle.
+Its optional versioned `z_t` cache accelerates frozen Actor-Critic
+consolidation, but never replaces factual reconstruction when gradients must
+enter the world model. MinimalSRU, Actor pressure and perception remain frozen
+until memory establishes a stronger behavioral baseline; their progressive
+opening is now Stage 8. The lifecycle and invalidation rules are specified in
+`contracts/latent_memory_contract.md`.

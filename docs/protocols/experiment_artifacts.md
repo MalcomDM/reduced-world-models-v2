@@ -14,6 +14,39 @@ transition semantics, or training loop internals.
 
 ## 1. Run Directory Layout
 
+Top-level paths describe the artifact's role before naming the experiment:
+
+```
+runs/
+    component_refinement/
+        <temporal_backend>/<NN_descriptive_experiment>/
+    imagined_actor_critic/
+        <temporal_backend>/<NN_descriptive_experiment>/<variant>/seed<N>/
+    evidence/
+        <reward|attention|tokenization|manual_traces>/...
+    _scratch/
+        <YYYYMMDD_descriptive_smoke>/...
+```
+
+- Use descriptive experiment names; stage numbers only provide ordering.
+- Canonical result directories contain a protocol/results document or a run
+  index entry and are never overwritten.
+- Smoke/preflight output belongs under `_scratch`, may be deleted at any time,
+  and must never support a thesis claim.
+- Do not mix different temporal backends or data-split seeds in one unnamed
+  directory.
+- Preserve both best and latest checkpoints for canonical training runs;
+  remove them only through an explicit retention decision.
+- Evaluation-only JSON/plots stay below the experiment that owns the
+  checkpoint unless they are cross-experiment evidence.
+
+The current `component_refinement/<backend>/` and `evidence/` trees already
+follow this convention. Historical Actor-Critic artifacts retain their old
+paths until a checkpoint-boundary migration can update every recorded
+reference atomically.
+
+Each individual structured run retains the following internal layout:
+
 ```
 runs/<experiment_name>/<run_id>/
     config.json              # Resolved ExperimentConfig (JSON)

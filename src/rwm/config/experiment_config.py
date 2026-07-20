@@ -114,13 +114,63 @@ class PerceptionConfig:
 
 @dataclasses.dataclass(frozen=True)
 class TemporalConfig:
-    """Causal Transformer temporal world model."""
+    """Causal Transformer or MinimalSRU temporal world model."""
+    backend: str = "causal_transformer"  # "causal_transformer" | "minimal_sru"
     seq_len: int = 20
     world_state_dim: int = 80
     observational_dropout: float = 0.6
     warmup_steps: int = 5
     ffn_mult: int = 2
     transformer_dropout: float = 0.1
+    # SRU-specific (ignored when backend == "causal_transformer"):
+    sru_carry_bias_init: float = 1.0
+    sru_burn_in_steps: int = 20
+    sru_state_init: str = "loss_masked_burn_in"
+    sru_training_mode: str = "random_burn_in"  # "random_burn_in" | "sequential_tbptt" | "random_macroblock_tbptt"
+    tbptt_steps: int = 16
+    macroblock_target_steps: int = 64
+    def __post_init__(self) -> None:
+        _VALID_BACKENDS = ("causal_transformer", "minimal_sru")
+        if self.backend not in _VALID_BACKENDS:
+            raise ValueError(
+                f"TemporalConfig.backend must be one of {_VALID_BACKENDS}, "
+                f"got {self.backend!r}"
+            )
+        if self.sru_burn_in_steps < 0:
+            raise ValueError(
+                f"sru_burn_in_steps must be non-negative, got {self.sru_burn_in_steps}"
+            )
+        _VALID_INITS = ("loss_masked_burn_in",)
+        if self.sru_state_init not in _VALID_INITS:
+            raise ValueError(
+                f"TemporalConfig.sru_state_init must be one of {_VALID_INITS}, "
+                f"got {self.sru_state_init!r}"
+            )
+        _VALID_MODES = ("random_burn_in", "sequential_tbptt", "random_macroblock_tbptt")
+        if self.sru_training_mode not in _VALID_MODES:
+            raise ValueError(
+                f"TemporalConfig.sru_training_mode must be one of {_VALID_MODES}, "
+                f"got {self.sru_training_mode!r}"
+            )
+        if self.sru_training_mode != "random_burn_in" and self.backend != "minimal_sru":
+            raise ValueError(
+                f"{self.sru_training_mode} training mode requires backend='minimal_sru', "
+                f"got backend={self.backend!r}"
+            )
+        if self.tbptt_steps < 1:
+            raise ValueError(
+                f"tbptt_steps must be >= 1, got {self.tbptt_steps}"
+            )
+        if self.sru_training_mode == "random_macroblock_tbptt":
+            if self.macroblock_target_steps < 1:
+                raise ValueError(
+                    f"macroblock_target_steps must be >= 1, got {self.macroblock_target_steps}"
+                )
+            if self.macroblock_target_steps % self.tbptt_steps != 0:
+                raise ValueError(
+                    f"macroblock_target_steps ({self.macroblock_target_steps}) must be "
+                    f"divisible by tbptt_steps ({self.tbptt_steps})"
+                )
 
     def to_dict(self) -> Dict[str, Any]:
         return _as_dict(self)
@@ -164,14 +214,34 @@ class TemporalMaskConfig:
     """Temporal observation-masking curriculum for D.1 training.
 
     When enabled, a contiguous block of steps after ``warmup_steps`` is
-    masked (spatial rep → zero) with per-sample probability that ramps
-    linearly from 0 to ``target_mask_probability`` over ``ramp_epochs``.
+    masked with per-sample probability that ramps linearly from 0 to
+    ``target_mask_probability`` over ``ramp_epochs``.
+
+    ``observation_dropout_execution`` controls how masked positions are handled:
+
+    * ``"post_perception"`` (default): all frames run through the full perception
+      pipeline; the spatial representation is zeroed after perception.  This
+      preserves legacy behavior and is bitwise-compatible with existing checkpoints.
+    * ``"pre_perception_skip"``: masked frames bypass encoder, tokenizer, scorer,
+        selector, and spatial head entirely.  A zero spatial representation and
+        sentinel diagnostics are injected directly.  When a batch has visible
+        positions, ``tok_mu``/``tok_logvar`` contain zeros at masked positions;
+        when it is fully masked, they are ``None``.
     """
     enabled: bool = False
     warmup_steps: int = 4
     horizons: List[int] = dataclasses.field(default_factory=lambda: [1, 2, 4, 8, 12])
     target_mask_probability: float = 0.5
     ramp_epochs: int = 2
+    observation_dropout_execution: str = "post_perception"
+
+    def __post_init__(self) -> None:
+        _VALID_EXEC = ("post_perception", "pre_perception_skip")
+        if self.observation_dropout_execution not in _VALID_EXEC:
+            raise ValueError(
+                f"observation_dropout_execution must be one of {_VALID_EXEC}, "
+                f"got {self.observation_dropout_execution!r}"
+            )
 
     def to_dict(self) -> Dict[str, Any]:
         return _as_dict(self)

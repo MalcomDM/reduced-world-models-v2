@@ -4,25 +4,27 @@
 Usage:
 
     # Bounded held-out validation (beta=0, reward-only):
-    python scripts/evaluate_reward_prediction.py --beta 0 --epochs 15 --out runs/reward_baseline_a \\
+    python scripts/evaluation/evaluate_reward_prediction.py --beta 0 --epochs 15 --out runs/reward_baseline_a \\
         --max-val-windows 128
 
     # KL-weighted validation (same split):
-    python scripts/evaluate_reward_prediction.py --beta 1.0 --epochs 15 --out runs/reward_kl_a \\
+    python scripts/evaluation/evaluate_reward_prediction.py --beta 1.0 --epochs 15 --out runs/reward_kl_a \\
         --max-val-windows 128
 
     # Action probe on a trained checkpoint:
-    python scripts/evaluate_reward_prediction.py --checkpoint runs/reward_baseline_a/checkpoint_best.pt
+    python scripts/evaluation/evaluate_reward_prediction.py --checkpoint runs/reward_baseline_a/checkpoint_best.pt
 
     # Profile eval throughput:
-    python scripts/evaluate_reward_prediction.py --profile --max-val-windows 256 --out /tmp/reward_profile
+    python scripts/evaluation/evaluate_reward_prediction.py --profile --max-val-windows 256 --out /tmp/reward_profile
 
     # Short smoke:
-    python scripts/evaluate_reward_prediction.py --smoke --out runs/reward_smoke
+    python scripts/evaluation/evaluate_reward_prediction.py --smoke --out runs/reward_smoke
 """
 
 import argparse
+import dataclasses
 import json
+import math
 import sys
 import time
 from pathlib import Path
@@ -37,7 +39,7 @@ from rwm.data.rollout_dataset import (
     _collect_npz_files,
 )
 from rwm.trainers.deterministic.world_model_trainer import WorldModelTrainer
-from rwm.config.experiment_config import ExperimentConfig, DataConfig, PerceptionConfig, ControllerConfig, TrainingConfig, TemporalMaskConfig
+from rwm.config.experiment_config import ExperimentConfig, DataConfig, TemporalConfig, PerceptionConfig, ControllerConfig, TrainingConfig, TemporalMaskConfig
 from rwm.utils.run_directory import create_run_directory
 from rwm.utils.dataset_manifest import build_dataset_manifest, save_manifest
 from rwm.utils.seeding import set_seed
@@ -68,9 +70,13 @@ def _collect_and_split(
     return train_files, val_files
 
 
-def _bounded_val_loader(val_files, sequence_len, batch_size, max_val_windows, seed, cache_dir=None):
+def _bounded_val_loader(val_files, sequence_len, batch_size, max_val_windows, seed, cache_dir=None,
+                         recurrent_context=False, burn_in_steps=0):
     """Create a DataLoader limited to max_val_windows windows."""
-    ds = RolloutDataset.from_file_list(val_files, sequence_len=sequence_len, cache_dir=cache_dir)
+    ds = RolloutDataset.from_file_list(
+        val_files, sequence_len=sequence_len, cache_dir=cache_dir,
+        recurrent_context=recurrent_context, burn_in_steps=burn_in_steps,
+    )
     n = min(max_val_windows, len(ds))
     rng = np.random.RandomState(seed)
     indices = rng.choice(len(ds), size=n, replace=False).tolist()
@@ -88,6 +94,7 @@ def run(
     sequence_len: int = 16,
     batch_size: int = 8,
     max_epochs: int = 15,
+    image_size: int = 64,
     lr: float = 3e-4,
     beta: float = 0.0,
     val_ratio: float = 0.2,
@@ -107,6 +114,15 @@ def run(
     temporal_mask_horizons: Optional[List[int]] = None,
     temporal_mask_probability: float = 0.5,
     temporal_mask_ramp_epochs: int = 2,
+    observation_dropout_execution: str = "post_perception",
+    temporal_backend: str = "causal_transformer",
+    sru_burn_in_steps: int = 20,
+    sru_carry_bias_init: float = 1.0,
+    sru_training_mode: str = "random_burn_in",
+    tbptt_steps: int = 16,
+    macroblock_target_steps: int = 64,
+    validate_every: int = 1,
+    macro_passes: Optional[int] = None,
 ) -> Dict:
     set_seed(seed)
 
@@ -118,6 +134,15 @@ def run(
             dataset_dir=str(DATA_ROOT.resolve()),
             sequence_len=sequence_len,
             cache_dir=str(cache_dir.resolve()) if cache_dir is not None else "",
+        ),
+        temporal=TemporalConfig(
+            backend=temporal_backend,
+            seq_len=sequence_len,
+            sru_burn_in_steps=sru_burn_in_steps,
+            sru_carry_bias_init=sru_carry_bias_init,
+            sru_training_mode=sru_training_mode,
+            tbptt_steps=tbptt_steps,
+            macroblock_target_steps=macroblock_target_steps,
         ),
         perception=PerceptionConfig(
             k=selection_k,
@@ -140,9 +165,65 @@ def run(
                 horizons=temporal_mask_horizons or [1, 2, 4, 8, 12],
                 target_mask_probability=temporal_mask_probability,
                 ramp_epochs=temporal_mask_ramp_epochs,
+                observation_dropout_execution=observation_dropout_execution,
             ),
         ),
     )
+
+    train_files, val_files = _collect_and_split(
+        DATA_ROOT, val_ratio=val_ratio, seed=seed,
+        max_train_files=max_train_files,
+    )
+
+    is_sru = temporal_backend == "minimal_sru"
+    is_seq = is_sru and sru_training_mode == "sequential_tbptt"
+    is_mb = is_sru and sru_training_mode == "random_macroblock_tbptt"
+
+    if is_mb:
+        from rwm.data.macroblock_dataset import MacroblockDataset
+        train_ds = MacroblockDataset(
+            train_files, burn_in_steps=sru_burn_in_steps,
+            macroblock_target_steps=macroblock_target_steps,
+            image_size=image_size, cache_dir=cache_dir,
+        )
+    elif is_seq:
+        from rwm.data.sequential_episode_dataset import MultiStreamSequentialDataset
+        train_ds = MultiStreamSequentialDataset(
+            train_files, chunk_len=tbptt_steps,
+            batch_size=batch_size, image_size=image_size,
+            cache_dir=cache_dir,
+        )
+    else:
+        train_ds = RolloutDataset.from_file_list(
+            train_files, sequence_len=sequence_len, cache_dir=cache_dir,
+            recurrent_context=is_sru, burn_in_steps=sru_burn_in_steps if is_sru else 0,
+        )
+
+    # In macroblock mode, --epochs is a reference random-window budget rather
+    # than the internal number of macro passes.  This keeps experiment commands
+    # comparable while the log labels the actual pass unit explicitly.
+    reference_targets_per_epoch: Optional[int] = None
+    training_passes = max_epochs
+    if is_mb:
+        reference_ds = RolloutDataset.from_file_list(
+            train_files, sequence_len=sequence_len, cache_dir=cache_dir,
+        )
+        reference_targets_per_epoch = len(reference_ds) * sequence_len
+        macro_targets_per_pass = sum(sample.target_len for sample in train_ds.samples)
+        if macro_targets_per_pass < 1:
+            raise ValueError("Macroblock dataset has no valid target transitions")
+        if macro_passes is not None:
+            if macro_passes < 1:
+                raise ValueError(f"macro_passes must be >= 1, got {macro_passes}")
+            training_passes = macro_passes
+        else:
+            training_passes = math.ceil(
+                max_epochs * reference_targets_per_epoch / macro_targets_per_pass
+            )
+        cfg = dataclasses.replace(
+            cfg,
+            training=dataclasses.replace(cfg.training, max_epochs=training_passes),
+        )
 
     run_dir = create_run_directory(
         "reward_prediction",
@@ -152,24 +233,38 @@ def run(
     )
     out_dir = run_dir
     print(f"Run directory: {out_dir}")
+    if is_mb:
+        print(
+            f"Macro budget: {max_epochs} reference epochs -> {training_passes} macro passes "
+            f"({reference_targets_per_epoch} target positions/reference epoch)"
+        )
 
     probe_path = out_dir / "probes" / "default_probe.npz"
     make_default_probe(probe_path)
 
-    train_files, val_files = _collect_and_split(
-        DATA_ROOT, val_ratio=val_ratio, seed=seed,
-        max_train_files=max_train_files,
+    # Validation always uses random-burn-in SRU dataset for matched scoring,
+    # regardless of training mode.  Sequentiality is a training-cost ablation;
+    # evaluation uses fixed burn-in reconstruction for comparable held-out metrics.
+    val_ds = RolloutDataset.from_file_list(
+        val_files, sequence_len=sequence_len, cache_dir=cache_dir,
+        recurrent_context=is_sru, burn_in_steps=sru_burn_in_steps if is_sru else 0,
     )
-
-    train_ds = RolloutDataset.from_file_list(
-        train_files, sequence_len=sequence_len, cache_dir=cache_dir,
-    )
-    nw = cfg.data.num_workers
-    train_loader = DataLoader(
-        train_ds, batch_size=batch_size, shuffle=True,
-        drop_last=True, num_workers=nw, pin_memory=True,
-        persistent_workers=nw > 0,
-    )
+    if is_mb:
+        train_loader = DataLoader(
+            train_ds, batch_size=batch_size, shuffle=True,
+            # Do not discard the final macroblocks: a macro pass is defined
+            # to cover every non-overlapping target region exactly once.
+            drop_last=False, num_workers=0,
+        )
+    elif is_seq:
+        train_loader = DataLoader(train_ds, batch_size=None, num_workers=0)
+    else:
+        nw = cfg.data.num_workers
+        train_loader = DataLoader(
+            train_ds, batch_size=batch_size, shuffle=True,
+            drop_last=True, num_workers=nw, pin_memory=True,
+            persistent_workers=nw > 0,
+        )
 
     val_loader = None
     actual_val_windows = 0
@@ -178,14 +273,12 @@ def run(
             val_loader, actual_val_windows = _bounded_val_loader(
                 val_files, sequence_len, batch_size, max_val_windows, seed,
                 cache_dir=cache_dir,
+                recurrent_context=is_sru, burn_in_steps=sru_burn_in_steps if is_sru else 0,
             )
         else:
-            ds = RolloutDataset.from_file_list(
-                val_files, sequence_len=sequence_len, cache_dir=cache_dir,
-            )
-            actual_val_windows = len(ds)
+            actual_val_windows = len(val_ds)
             val_loader = DataLoader(
-                ds, batch_size=batch_size, shuffle=False,
+                val_ds, batch_size=batch_size, shuffle=False,
                 drop_last=False, num_workers=1, pin_memory=True,
             )
 
@@ -211,7 +304,7 @@ def run(
         val_loader=val_loader,
         out_dir=out_dir,
         sequence_len=sequence_len,
-        epochs=1 if profile else max_epochs,
+        epochs=1 if profile else training_passes,
         batch_size=batch_size,
         lr=lr,
         beta=beta,
@@ -245,7 +338,12 @@ def run(
         }
 
     start = time.time()
-    best_path = trainer.fit()
+    best_path = trainer.fit(
+        validate_every=validate_every,
+        progress_label="Macro pass" if is_mb else "Epoch",
+        reference_targets_per_epoch=reference_targets_per_epoch,
+        reference_epochs=max_epochs if is_mb else None,
+    )
     elapsed = time.time() - start
 
     gpu_peak = torch.cuda.max_memory_allocated() / 1e9 if torch.cuda.is_available() else 0.0
@@ -270,6 +368,8 @@ def run(
         "seed": seed,
         "beta": beta,
         "epochs": max_epochs,
+        "training_passes": training_passes,
+        "epoch_unit": "reference_target_budget" if is_mb else "dataset_epoch",
         "train_files": len(train_files),
         "val_files": len(val_files) if val_files else 0,
         "train_windows": len(train_ds),
@@ -363,8 +463,13 @@ def main():
     )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--sequence-len", type=int, default=16)
+    parser.add_argument("--image-size", type=int, default=64)
     parser.add_argument("--batch-size", type=int, default=8)
-    parser.add_argument("--epochs", type=int, default=15)
+    parser.add_argument(
+        "--epochs", type=int, default=None,
+        help=("Dataset epochs for normal training; reference random-window epochs "
+              "for random_macroblock_tbptt (default: 15)."),
+    )
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--beta", type=float, default=0.0)
     parser.add_argument("--val-ratio", type=float, default=0.2)
@@ -397,9 +502,44 @@ def main():
                         help="Target per-sample mask probability after ramp")
     parser.add_argument("--temporal-mask-ramp-epochs", type=int, default=2,
                         help="Epochs over which mask probability ramps from 0 to target")
+    parser.add_argument("--observation-dropout-execution", type=str, default="post_perception",
+                        choices=["post_perception", "pre_perception_skip"],
+                        help="Observational dropout execution policy")
+    parser.add_argument("--temporal-backend", type=str, default="causal_transformer",
+                        choices=["causal_transformer", "minimal_sru"],
+                        help="Temporal backbone (default: causal_transformer)")
+    parser.add_argument("--sru-burn-in-steps", type=int, default=20,
+                        help="Burn-in context steps for SRU (ignored in causal mode)")
+    parser.add_argument("--sru-carry-bias-init", type=float, default=1.0,
+                        help="Initial carry gate bias for SRU (ignored in causal mode)")
+    parser.add_argument("--sru-training-mode", type=str, default="random_burn_in",
+                        choices=["random_burn_in", "sequential_tbptt", "random_macroblock_tbptt"],
+                        help="SRU training mode")
+    parser.add_argument("--tbptt-steps", type=int, default=16,
+                        help="Truncated BPTT chunk length for sequential_tbptt or random_macroblock_tbptt")
+    parser.add_argument("--macroblock-target-steps", type=int, default=64,
+                        help="Target steps per macroblock for random_macroblock_tbptt mode")
+    parser.add_argument(
+        "--macro-passes", type=int, default=None,
+        help=("Advanced explicit macro-pass count. Only valid with "
+              "random_macroblock_tbptt and mutually exclusive with --epochs."),
+    )
+    parser.add_argument("--validate-every", type=int, default=1,
+                        help="Validate every N passes (default 1 = every pass; final pass always validates)")
     parser.add_argument("--checkpoint", type=Path, default=None,
                         help="Path to checkpoint for action probe")
     args = parser.parse_args()
+
+    epochs_was_explicit = args.epochs is not None
+    if args.epochs is None:
+        args.epochs = 15
+    if args.macro_passes is not None:
+        if args.sru_training_mode != "random_macroblock_tbptt":
+            parser.error("--macro-passes requires --sru-training-mode random_macroblock_tbptt")
+        if epochs_was_explicit:
+            parser.error("Use either --epochs or --macro-passes, not both")
+    if args.epochs < 1:
+        parser.error("--epochs must be >= 1")
 
     if args.checkpoint:
         action_probe_dir = args.out or Path("runs/reward_prediction/action_probe")
@@ -423,6 +563,7 @@ def main():
             out_dir=args.out,
             seed=args.seed,
             sequence_len=args.sequence_len,
+            image_size=args.image_size,
             batch_size=args.batch_size,
             max_epochs=args.epochs,
             lr=args.lr,
@@ -444,6 +585,14 @@ def main():
             temporal_mask_horizons=args.temporal_mask_horizons,
             temporal_mask_probability=args.temporal_mask_probability,
             temporal_mask_ramp_epochs=args.temporal_mask_ramp_epochs,
+            observation_dropout_execution=args.observation_dropout_execution,
+            temporal_backend=args.temporal_backend,
+            sru_burn_in_steps=args.sru_burn_in_steps,
+            sru_carry_bias_init=args.sru_carry_bias_init,
+            sru_training_mode=args.sru_training_mode,
+            tbptt_steps=args.tbptt_steps,
+            macroblock_target_steps=args.macroblock_target_steps,
+            validate_every=args.validate_every,
         )
     except FileExistsError as error:
         parser.error(

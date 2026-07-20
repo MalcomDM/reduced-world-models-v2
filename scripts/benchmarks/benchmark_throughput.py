@@ -2,7 +2,7 @@
 """Measure world-model training throughput before/after performance refactors.
 
 Usage:
-    python scripts/benchmark_throughput.py \
+    python scripts/benchmarks/benchmark_throughput.py \
         --out runs/component_refinement/causal_transformer/benchmarks/baseline.json
 
 Runs forward+backward on synthetic data with CUDA sync, reporting:

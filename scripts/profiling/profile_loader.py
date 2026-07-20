@@ -9,9 +9,9 @@ Measures one epoch with CUDA synchronization, reporting:
   - total epoch time, windows/sec, frames/sec, peak GPU memory
 
 Usage:
-    python scripts/profile_loader.py --num-workers 2 --pin-memory 1
-    python scripts/profile_loader.py --num-workers 0
-    python scripts/profile_loader.py --num-workers 4 --pin-memory 1 --persistent-workers
+    python scripts/profiling/profile_loader.py --num-workers 2 --pin-memory 1
+    python scripts/profiling/profile_loader.py --num-workers 0
+    python scripts/profiling/profile_loader.py --num-workers 4 --pin-memory 1 --persistent-workers
 """
 
 import argparse

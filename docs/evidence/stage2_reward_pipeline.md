@@ -53,13 +53,13 @@ RewardHead(shared(belief_t), action[t]) → reward[t] (= r_{t+1})
 
 **Command (seed 42):**
 ```bash
-python scripts/evaluate_reward_prediction.py --beta 0.0 --epochs 10 \
+python scripts/evaluation/evaluate_reward_prediction.py --beta 0.0 --epochs 10 \
     --out runs/component_refinement/causal_transformer/00_reward_anchor_pre_kl_fix/seed_42/reproduction_seed42 --max-val-windows 256 --batch-size 8 --seed 42
 ```
 
 **Command (seed 43):**
 ```bash
-python scripts/evaluate_reward_prediction.py --beta 0.0 --epochs 10 \
+python scripts/evaluation/evaluate_reward_prediction.py --beta 0.0 --epochs 10 \
     --out runs/component_refinement/causal_transformer/00_reward_anchor_pre_kl_fix/seed_43 --max-val-windows 256 --batch-size 8 --seed 43
 ```
 
