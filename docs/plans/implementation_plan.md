@@ -205,7 +205,7 @@ Establish one equal-budget uniform replay cycle before claiming that smart
 selection helps. Persist policy/model provenance, environment seed,
 termination, source hashes and transition budgets.
 
-### 7.1 — Stratified Factual Memory
+### 7.1 — Probabilistic Factual Memory
 
 The permanent unit is a factual pointer, not an activation:
 
@@ -216,17 +216,20 @@ The permanent unit is a factual pointer, not an activation:
 - termination/truncation;
 - optional TD error, novelty, rarity and return-change metadata.
 
-Use a mixture with explicit capacity per stratum:
+Use continuous train-only percentile/rank signals:
 
-- ordinary/coverage transitions;
-- positive or high-return events;
-- negative/off-road/terminal events;
-- rapid return changes and surprising transitions;
-- rare boundary cases.
+- high and low finite-horizon factual return;
+- directional, locally smoothed reward-rate changes (recovery and degradation);
+- termination or rare-boundary bonuses;
+- later, versioned learning-progress/mastery signals.
 
-Use bounded FIFO/reservoir replacement inside each stratum. Preserve a nonzero
-uniform floor. Positive-only replay is permitted only as an explicitly labelled
-overfit diagnostic, never as the default policy-training distribution.
+Preserve a nonzero uniform floor and rebuild a bounded active dream set through
+weighted sampling without replacement. The complete factual-pointer index
+remains cheap and permanent; old active memories leave naturally when new
+weighted samples are drawn. Reporting tags may describe positive, negative,
+ordinary, change and terminal cases, but they do not impose fixed slice
+budgets. Positive-only replay is permitted only as an explicitly labelled
+overfit diagnostic.
 
 ### 7.2 — Versioned `z_t` Working Cache
 
@@ -250,12 +253,12 @@ Gate:
 Compare equal budgets:
 
 1. uniform factual starts;
-2. stratified memory mixture;
+2. continuous probabilistic-priority memory;
 3. positive-heavy overfit diagnostic.
 
 Measure:
 
-- Critic fit and calibration by memory stratum;
+- Critic fit and calibration by return/priority quantile;
 - Actor imagined return and action diversity;
 - deterministic factual branch outcomes from stored starts;
 - locked real-environment return;
@@ -271,15 +274,21 @@ better first policy.
    exploration.
 2. **Ground:** optionally update reward/dynamics representations using factual
    reward/KL anchors only.
-3. **Materialize:** rebuild stratified pointers/priorities and versioned cache.
+3. **Materialize:** rebuild continuous pointer priorities and the versioned
+   active cache.
 4. **Dream:** cheaply consolidate Actor/Critic from cached starts.
 5. **Consolidate:** train Actor/Critic from selected starts; keep behavior
    gradients out of ControllerTrunk, MinimalSRU and perception.
 6. **Evaluate:** fixed probes, unseen seeds, resource budget and regressions.
 
+A later optional scenario curriculum may index deterministic
+`(environment seed, prefix, horizon, goal version)` records and prioritize
+unmastered/stale scenarios. Stage 7 only preserves the metadata needed for
+that extension; it does not block the initial memory experiment.
+
 ### Stage-7 exit
 
-- smart replay beats the equal-budget uniform baseline;
+- probabilistic replay beats the equal-budget uniform baseline;
 - at least two collection cycles improve real behavior without forgetting;
 - memory replacement and invalidation are deterministic and tested;
 - behavior improvements survive unseen tracks/seeds.
@@ -365,7 +374,7 @@ Run matched ablations only on the selected full-cycle configuration:
 - stochastic tokenizer/KL variants;
 - observational dropout on/off and horizon variation;
 - frozen versus Critic-shaped versus Actor+Critic-shaped representations;
-- uniform versus stratified memory versus cached starts;
+- uniform versus probabilistic-priority memory versus cached starts;
 - selected joint-gradient boundary versus the frozen-world-model control.
 
 Interpretability outputs:
@@ -400,7 +409,8 @@ these runs begin.
 ### Stretch hypothesis
 
 A small number of useful transitions in the initial random-policy corpus,
-combined with stratified memory and cheap dream consolidation, may be enough
+combined with probabilistic-priority memory and cheap dream consolidation, may
+be enough
 for the first learned policy to acquire basic forward motion and partial road
 following.
 
@@ -442,8 +452,8 @@ Therefore:
   coverage, counterfactual-action, calibration or exploration bottleneck.
 
 The first memory experiment must measure the hypothesis rather than assume it:
-uniform versus stratified starts, positive-heavy overfit as a diagnostic, and
-locked factual/real evaluation after equal budgets.
+uniform versus probabilistic-priority starts, positive-heavy overfit as a
+diagnostic, and locked factual/real evaluation after equal budgets.
 
 ## Required Metrics
 

@@ -2,8 +2,8 @@
 
 ## Purpose and boundary
 
-Stage 7 tests whether selecting informative factual starts improves
-Actor-Critic learning efficiency over uniform replay.
+Stage 7 tests whether continuous probabilistic selection of informative
+factual starts improves Actor-Critic learning efficiency over uniform replay.
 
 It begins from the split-clean frozen controls:
 
@@ -35,9 +35,10 @@ The canonical lifecycle and cache semantics remain in
    horizons and real-environment interactions.
 5. **Keep a uniform floor.** The default memory cannot become positive-only or
    discard ordinary state coverage.
-6. **Strata use factual evidence first.** Immediate rewards, finite-horizon
-   factual returns, termination and reward changes define the first index.
-   TD error/model surprise may be added only with explicit model versions.
+6. **Use continuous factual priorities first.** Immediate rewards,
+   finite-horizon factual returns, termination and reward changes define the
+   first priority. TD error/model surprise may be added only with explicit
+   model versions.
 7. **Behavior return is evidence, not an Actor target.** It is neither the
    optimal return nor automatically an unbiased Critic target for a new policy.
 8. **Cached `z_t` has no historical gradient.** It may train Actor/Critic and
@@ -48,8 +49,9 @@ The canonical lifecycle and cache semantics remain in
 10. **Dependency-aware invalidation.** Perception or SRU changes invalidate
     `z_t`; Actor/Critic/Controller changes only refresh their dependent
     priorities. A cached `c_t` would also depend on ControllerTrunk.
-11. **Bounded retention.** Use deterministic reservoir/FIFO behavior within
-    each declared stratum and record every replacement.
+11. **Bound the working set first.** Keep all cheap factual pointers while
+    practical; probabilistically rebuild a bounded active dream/cache set each
+    cycle.
 12. **Overfitting is a diagnostic.** Positive-heavy replay may test capacity,
     but cannot become the selected training distribution without matched
     generalization and real-environment evidence.
@@ -67,14 +69,14 @@ The canonical lifecycle and cache semantics remain in
 - action/reward timing-contract version;
 - immediate reward, terminated and truncated separately;
 - declared horizon-specific factual returns;
-- primary stratum plus non-exclusive descriptive tags.
+- continuous priority inputs plus non-exclusive descriptive tags.
 
 ### Versioned derived metadata
 
 - return change or reward-event score;
 - rarity/count statistics and their population digest;
 - optional model error, TD error or novelty with producer checkpoint hash;
-- sampling weight and last priority-refresh version.
+- sampling weight, probability and last priority-refresh version.
 
 ### Optional working cache
 
@@ -83,25 +85,73 @@ The canonical lifecycle and cache semantics remain in
 - exact state-producing parameter hash;
 - materialization timestamp and cache schema.
 
-## Initial strata
+## Continuous priority and active-set sampling
 
-The data-audit checkpoint determines thresholds and capacities before policy
-training. It must support at least:
+For pointer `i`, compute train-only percentile ranks:
 
-- ordinary coverage;
-- positive/high factual return;
-- negative/off-road/terminal behavior;
-- rapid reward/return changes;
-- rare or boundary cases.
+```text
+qGᵢ = percentile rank of finite-horizon factual return
+q⁺ᵢ = max(0, 2qGᵢ - 1)       # upper-half extremeness
+q⁻ᵢ = max(0, 1 - 2qGᵢ)       # lower-half extremeness
+dᵢ  = mean(r[i:i+h]) - mean(r[i-h:i])
+q↑ᵢ = positive-tail percentile of dᵢ, else 0    # recovery/improvement
+q↓ᵢ = positive-tail percentile of -dᵢ, else 0   # degradation/failure
+```
 
-Records may have multiple tags but exactly one deterministic primary stratum
-for capacity and replacement accounting. Thresholds, precedence, mixture
-weights and uniform-floor probability are frozen before the matched runs.
+An initial continuous weight may use:
 
-No fixed memory size is assumed in advance. The inventory first reports how
-many independent pointers actually exist in every stratum; capacity is then
-chosen so minority strata are meaningful without duplicating a handful of
-events excessively.
+```text
+wᵢ = η
+   + λ₊ (ε + q⁺ᵢ)^α
+   + λ₋ (ε + q⁻ᵢ)^α
+   + λ↑ (ε + q↑ᵢ)^β
+   + λ↓ (ε + q↓ᵢ)^β
+   + λT terminalᵢ
+```
+
+`η > 0` is the uniform coverage floor. The separated `q⁺`/`q⁻` terms avoid the
+degenerate `q + (1-q) = 1` case. Coefficients and exponents are declared after
+the corpus audit and frozen before training. Percentiles avoid dependence on
+CarRacing's absolute reward scale. The local window `h` is also frozen by the
+7.0A protocol. It uses a short reward-rate comparison rather than adjacent raw
+rewards, so ordinary sparse reward pulses do not all become “surprises.”
+
+`q↑` and `q↓` are priority signals and reporting tags, not reserved memory
+capacities. They preserve both recovery and failure transitions while allowing
+all records to compete in the same probabilistic active set. Model prediction
+error may later add a separate, checkpoint-versioned surprise term; it is not
+mixed with this factual change signal.
+
+Normalize `P(i) = wᵢ / Σⱼwⱼ`. Draw the active set without replacement. A
+simple reproducible implementation may assign:
+
+```text
+keyᵢ = -log(Uᵢ) / wᵢ
+```
+
+and retain the `M` smallest keys, where `Uᵢ` is deterministically generated
+from `(cycle_seed, pointer_id)`. This is weighted reservoir sampling. `M` is a
+compute/cache budget, not a separate quota for reward slices.
+
+The complete factual index remains available. Every cycle generates new keys,
+so new high-value pointers can enter and old working memories can leave without
+explicit pairwise similarity or destructive deletion. Positive, negative,
+ordinary, transition and terminal labels remain useful for reports, not for
+hard storage partitions.
+
+This is competition by **factual priority**, not semantic image similarity.
+If the corpus audit shows that one dense return region monopolizes the active
+set, a lightweight one-dimensional crowding correction may be declared:
+
+```text
+gapᵢ = qGᵢ₊₁ - qGᵢ₋₁
+wᵢ ← wᵢ · (ε + gapᵢ)^ρ
+```
+
+after sorting by `qG`. Dense neighbors then receive less mass while isolated
+return regions are retained. This uses the already indexed scalar return and
+is not a learned similarity model. It is optional and must be frozen by the
+7.0A protocol before any policy comparison.
 
 ## Stage 7.0 — Measurement and uniform foundation
 
@@ -111,11 +161,13 @@ Build a read-only profiler over eligible training files:
 
 - unique transitions and possible start pointers;
 - immediate-reward and finite-horizon-return distributions;
-- counts for reward changes, terminal/off-road candidates and rare tags;
-- overlap among candidate strata;
-- episode/file contribution to each stratum.
+- counts and distributions for smoothed upward/downward reward-rate changes,
+  terminal/off-road candidates and rare tags;
+- percentile/tie distributions and aggregate priority mass;
+- episode/file contribution across priority quantiles.
 
-Deliver a compact report and proposed thresholds. Do not train.
+Deliver a compact report and proposed coefficients, exponents, uniform floor
+and active-set size. Do not train.
 
 ### 7.0B — Factual pointer index
 
@@ -139,24 +191,24 @@ sampled factual starts. This is the control for every smart-memory claim.
 Persist exact pointer IDs sampled per update so another sampler can reproduce
 the same budget, even when its distribution differs.
 
-## Stage 7.1 — Stratified factual memory
+## Stage 7.1 — Probabilistic factual memory
 
 Implement:
 
-- deterministic primary-stratum assignment;
-- bounded per-stratum capacities;
-- FIFO/reservoir replacement;
-- configurable mixture weights and nonzero uniform floor;
-- composition and replacement reports;
+- deterministic percentile/rank calculation with tie handling;
+- continuous weight calculation and nonzero uniform floor;
+- weighted sampling without replacement;
+- bounded active-set rebuild with deterministic cycle seeds;
+- quantile/tag composition and entry/exit reports;
 - priority refresh independent from pointer identity.
 
 Acceptance:
 
 - achieved sampling frequencies match declared probabilities within tolerance;
-- empty/minority strata have explicit fallback behavior;
 - no evaluation pointer can be inserted;
 - old factual pointers survive model/cache invalidation;
-- every sampled item reports probability and stratum.
+- every sampled item reports probability, weight and diagnostic tags;
+- new pointers can enter and old active pointers can leave reproducibly.
 
 ## Stage 7.2 — Versioned `z_t` working cache
 
@@ -180,7 +232,7 @@ valid without it.
 Compare from identical initial checkpoints:
 
 1. uniform factual starts;
-2. stratified mixture;
+2. continuous probabilistic-priority replay;
 3. positive-heavy capacity/overfit diagnostic.
 
 The third condition is not a candidate default. It answers whether the Actor
@@ -199,7 +251,7 @@ Matched quantities:
 Measurements:
 
 - imagined return and reward-model exploitation gap;
-- Critic error/calibration by primary stratum;
+- Critic error/calibration by return and priority quantile;
 - action entropy, bounds, diversity and state dependence;
 - deterministic branch outcomes from selected factual prefixes where replay
   is available;
@@ -210,12 +262,39 @@ Measurements:
 Primary behavioral success criteria and numerical tolerances are declared
 after the corpus inventory but before any policy run.
 
+## Optional future layer — Scenario mastery
+
+The same pointer system can later define a replayable scenario:
+
+```text
+scenario_id = (environment_seed, prefix_t, horizon, goal_version)
+```
+
+Store attempt count, last attempt, an exponential moving average of achieved
+return/success, a target threshold and recent learning progress. A future
+continuous need score can combine:
+
+```text
+need = λgap · max(0, target - mastery)
+     + λprogress · |mastery_now - mastery_old|
+     + λstale · staleness
+```
+
+Mastered scenarios lose gap priority; stale skills can return; learning
+progress favors scenarios the agent can currently improve. Caps and the
+uniform floor prevent impossible scenarios from monopolizing replay.
+
+This resembles prioritized level replay and automatic curricula, but it is
+**not part of the first Stage-7 implementation**. We only preserve the
+scenario/provenance fields needed to add it later. Exact deterministic prefix
+replay and generic goal definitions must be validated before activation.
+
 ## Stage 7.4 — First wake–dream cycle
 
 After selecting the replay distribution:
 
 1. collect new factual experience with declared exploration;
-2. evaluate and insert pointers using the frozen stratum contract;
+2. evaluate and insert pointers using the frozen continuous-priority contract;
 3. optionally update the world model using factual reward/KL anchors only;
 4. invalidate and rebuild `z_t` if perception/SRU changed;
 5. consolidate Actor/Critic in dreams;
@@ -226,7 +305,8 @@ No Actor/Critic gradient enters SRU or perception in Stage 7.
 ## Evidence hierarchy
 
 1. **Capacity:** positive-heavy replay can improve selected starts.
-2. **Memory contribution:** stratified beats equal-budget uniform replay.
+2. **Memory contribution:** probabilistic priority beats equal-budget uniform
+   replay.
 3. **Transfer:** improvement survives held-out factual/scenario probes.
 4. **Behavior:** locked development-track return improves.
 5. **Cycle:** improvement persists after new experience and cache refresh.
@@ -238,7 +318,7 @@ MinimalSRU, Actor-Critic or the complete architecture.
 
 Tracked documentation:
 
-- corpus inventory and frozen threshold/mixture protocol;
+- corpus inventory and frozen priority/sampling protocol;
 - implementation report and test results;
 - matched comparison table and limitations;
 - concise thesis-facing theoretical-probe entry.
@@ -257,10 +337,28 @@ and peak memory.
 ## Stage-7 exit
 
 - memory mechanics and invalidation tests pass;
-- stratified replay is compared with uniform under matched budgets;
+- probabilistic priority replay is compared with uniform under matched budgets;
 - positive-heavy capacity result is clearly separated from generalization;
 - selected replay improves or meaningfully diagnoses real behavior across two
   model seeds;
 - at least one wake–dream refresh preserves factual grounding;
 - a stronger frozen behavioral baseline is ready for Stage-8 joint-gradient
   calibration.
+
+## Theoretical precedents and scope
+
+This protocol is a deliberately small synthesis, not a claim of a new
+standalone memory algorithm:
+
+- [Prioritized Experience Replay](https://arxiv.org/abs/1511.05952) motivates
+  non-uniform replay while preserving a stochastic sampling floor.
+- [Weighted reservoir sampling](https://www.sciencedirect.com/science/article/pii/S002001900500298X)
+  provides the reproducible bounded active-set mechanism without fixed reward
+  buckets.
+- [Prioritized Level Replay](https://proceedings.mlr.press/v139/jiang21b.html)
+  and [automatic curriculum learning](https://arxiv.org/abs/1704.03003)
+  motivate the deferred mastery, learning-progress and staleness fields.
+
+Stage 7 initially uses factual return ranks rather than TD error so its memory
+comparison does not depend on an immature Critic. Policy-dependent priorities
+remain a later, explicitly versioned extension.

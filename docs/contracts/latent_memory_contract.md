@@ -70,10 +70,22 @@ Transformer cache would additionally require its bounded history and lengths.
 ## Sampling and retention
 
 - Establish an equal-budget uniform replay baseline first.
-- If prioritization is justified, keep a nonzero uniform floor and mix
-  ordinary, positive, negative, surprising, rare, and terminal strata.
-- High reward alone is not a valid replay distribution.
-- Use bounded FIFO/reservoir replacement inside each training stratum.
+- Keep the complete factual-pointer index while it remains cheap. Bound the
+  active dream set and latent cache, not the factual source of truth.
+- Priorities are continuous functions of train-only percentile ranks and
+  versioned learning signals, with a nonzero uniform floor.
+- Factual surprise is represented by directional, locally smoothed reward-rate
+  change. It contributes priority but does not own a fixed-capacity partition.
+  Model-error surprise is a separate future signal with a producer-checkpoint
+  version.
+- Rebuild the bounded active dream set probabilistically each cycle using
+  weighted sampling without replacement. New pointers then compete naturally
+  with old active memories.
+- High reward alone is not a valid replay distribution. Positive, negative,
+  change, terminal and ordinary coverage remain reporting tags, not mandatory
+  fixed-capacity buckets.
+- If the factual index itself later becomes too large, use a declared weighted
+  reservoir; never silently delete pointers according to latent similarity.
 - Keep fixed evaluation probes and rare factual boundary cases outside the
   mutable training-memory population.
 - Record mixture weights. If weighting changes the objective, apply/report
@@ -95,8 +107,8 @@ Transformer cache would additionally require its bounded history and lengths.
    starts under identical start samples and imagined-transition budgets.
 3. Stage 6 reconstructs factual contexts whenever gradients enter the world
    model.
-4. Stage 7 establishes uniform replay, then tests bounded stratified replay as
-   the explicit first-cycle policy-bootstrap hypothesis.
+4. Stage 7 establishes uniform replay, then tests continuous probabilistic
+   priority replay as the explicit first-cycle policy-bootstrap hypothesis.
 
 ## Minimum acceptance tests
 
